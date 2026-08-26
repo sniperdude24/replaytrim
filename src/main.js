@@ -49,11 +49,16 @@ async function main() {
       alert("Connect to OBS first.");
       return;
     }
+    editorEl.className = "empty-state-wrap";
     editorEl.innerHTML = `<p class="empty-state">Grabbing last replay…</p>`;
     try {
       const path = await api.grabReplay();
+      // Drop the flex-centering wrapper class: a centered child taller than
+      // the wrapper overflows off the top unreachably.
+      editorEl.className = "";
       await renderTrimEditor(editorEl, path);
     } catch (e) {
+      editorEl.className = "empty-state-wrap";
       editorEl.innerHTML = `<p class="empty-state">Grab failed: ${e}</p>`;
     }
   }
@@ -76,6 +81,13 @@ async function main() {
 
   renderHeader();
   await applyHotkey();
+
+  // Auto-connect on launch when OBS credentials are already saved, so the
+  // global hotkey works immediately without opening the app window.
+  const config = await api.getConfig();
+  if (config.obs_password) {
+    await handleConnect();
+  }
 }
 
 main();

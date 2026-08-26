@@ -21,12 +21,14 @@ export async function renderTrimEditor(container, replayPath, onSent) {
         <span id="duration-label"></span>
         <span id="end-label">0.00s</span>
       </div>
-      <div class="trim-actions">
-        <label class="inline-checkbox"><input type="checkbox" id="fast-trim" checked> fast trim (instant, snaps to keyframe)</label>
-        <button id="preview-btn" class="btn btn-ghost">Preview Selection</button>
-        <button id="send-btn" class="btn btn-primary">Send to OBS</button>
+      <div class="trim-footer">
+        <div class="trim-actions">
+          <label class="inline-checkbox"><input type="checkbox" id="fast-trim" checked> fast trim (instant, snaps to keyframe)</label>
+          <button id="preview-btn" class="btn btn-ghost">Preview Selection</button>
+          <button id="send-btn" class="btn btn-primary">Send to OBS</button>
+        </div>
+        <p id="status-msg" class="hint"></p>
       </div>
-      <p id="status-msg" class="hint"></p>
     </section>
   `;
 

@@ -150,7 +150,7 @@ h2 {
 
 #preview {
   width: 100%;
-  max-height: 420px;
+  max-height: 360px;
   background: black;
   border-radius: 8px;
   margin-bottom: 0.75rem;
@@ -205,6 +205,16 @@ h2 {
   font-size: 0.8rem;
   color: var(--text-dim);
   margin-bottom: 1rem;
+}
+
+/* Pinned to the bottom of the scroll container so Send to OBS is always
+   visible even when the video + waveform overflow the window. */
+.trim-footer {
+  position: sticky;
+  bottom: 0;
+  background: var(--bg);
+  padding: 0.6rem 0 0.35rem;
+  border-top: 1px solid var(--border);
 }
 
 .trim-actions {
