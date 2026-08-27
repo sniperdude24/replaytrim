@@ -16,6 +16,24 @@ fn ffmpeg_command() -> Command {
     cmd
 }
 
+/// Media duration in seconds via ffprobe.
+pub fn probe_duration(input: &Path) -> anyhow::Result<f64> {
+    let mut cmd = Command::new("ffprobe");
+    #[cfg(windows)]
+    cmd.creation_flags(CREATE_NO_WINDOW);
+    let output = cmd
+        .args(["-v", "error", "-show_entries", "format=duration", "-of", "csv=p=0"])
+        .arg(input)
+        .output()?;
+    if !output.status.success() {
+        anyhow::bail!("ffprobe failed (exit {:?})", output.status.code());
+    }
+    String::from_utf8_lossy(&output.stdout)
+        .trim()
+        .parse::<f64>()
+        .map_err(|e| anyhow::anyhow!("could not parse duration: {e}"))
+}
+
 /// Renders a visual waveform PNG for the given media file using ffmpeg's
 /// showwavespic filter, and measures the clip's peak level in the same pass
 /// so the UI can tell the user when the audio is actually silent (instead of

@@ -33,9 +33,17 @@ export async function openSettingsPanel(onSaved) {
         <p class="hint">This Media Source's file will be updated and restarted whenever you send a trimmed clip. Place it anywhere in your scene layout.</p>
       </fieldset>
       <fieldset>
-        <legend>Grab Hotkey</legend>
-        <label>Global shortcut <input name="grab_hotkey" value="${escapeHtml(config.grab_hotkey)}" placeholder="CommandOrControl+Shift+R"></label>
-        <p class="hint">Works even while OBS/your game is focused. Restart the app after changing this.</p>
+        <legend>Keybinds</legend>
+        <label>Grab &amp; trim <input name="grab_hotkey" class="keybind-input" value="${escapeHtml(config.grab_hotkey)}" placeholder="click, then press keys" readonly></label>
+        <label>Instant replay (no trim) <input name="instant_hotkey" class="keybind-input" value="${escapeHtml(config.instant_hotkey ?? "")}" placeholder="click, then press keys" readonly></label>
+        <label>Replay again <input name="replay_hotkey" class="keybind-input" value="${escapeHtml(config.replay_hotkey ?? "")}" placeholder="click, then press keys" readonly></label>
+        <label>Hide replay <input name="hide_hotkey" class="keybind-input" value="${escapeHtml(config.hide_hotkey ?? "")}" placeholder="click, then press keys" readonly></label>
+        <p class="hint">Click a field, then press the key combo you want. Backspace clears it. Applies on Save — no restart needed. All keybinds work globally, even in-game.</p>
+      </fieldset>
+      <fieldset>
+        <legend>OBS Control Dock</legend>
+        <p class="hint">Get these buttons inside OBS: View → Docks → Custom Browser Docks → add<br>
+        <code style="user-select:all">http://127.0.0.1:${config.overlay_port ?? 8930}/dock</code></p>
       </fieldset>
       <div class="modal-actions">
         <button type="button" id="cancel-btn" class="btn btn-ghost">Cancel</button>
@@ -46,15 +54,46 @@ export async function openSettingsPanel(onSaved) {
 
   const form = document.getElementById("settings-form");
   form.querySelector("#cancel-btn").addEventListener("click", close);
+
+  // Press-to-record keybind fields: click, press a combo, done.
+  form.querySelectorAll(".keybind-input").forEach((input) => {
+    input.addEventListener("keydown", (e) => {
+      e.preventDefault();
+      if (e.key === "Backspace" || e.key === "Delete") {
+        input.value = "";
+        return;
+      }
+      if (e.key === "Escape") {
+        input.blur();
+        return;
+      }
+      // Ignore bare modifier presses — wait for a real key.
+      if (["Control", "Shift", "Alt", "Meta"].includes(e.key)) return;
+      const parts = [];
+      if (e.ctrlKey || e.metaKey) parts.push("CommandOrControl");
+      if (e.altKey) parts.push("Alt");
+      if (e.shiftKey) parts.push("Shift");
+      let key = e.key.length === 1 ? e.key.toUpperCase() : e.key;
+      if (key === " ") key = "Space";
+      parts.push(key);
+      input.value = parts.join("+");
+    });
+  });
   form.addEventListener("submit", async (e) => {
     e.preventDefault();
     const data = new FormData(form);
+    // Spread the existing config so fields this form doesn't show
+    // (target_kind, overlay_port, ...) survive the save.
     const newConfig = {
+      ...config,
       obs_host: data.get("obs_host"),
       obs_port: Number(data.get("obs_port")),
       obs_password: data.get("obs_password"),
       target_source: data.get("target_source"),
       grab_hotkey: data.get("grab_hotkey"),
+      instant_hotkey: data.get("instant_hotkey"),
+      replay_hotkey: data.get("replay_hotkey"),
+      hide_hotkey: data.get("hide_hotkey"),
     };
     await api.saveConfig(newConfig);
     close();

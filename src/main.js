@@ -1,5 +1,6 @@
 import { register, unregister } from "@tauri-apps/plugin-global-shortcut";
 import { api } from "./api.js";
+import { openModal } from "./components/modal.js";
 import { renderStatusHeader } from "./views/statusHeader.js";
 import { openSettingsPanel } from "./views/settingsPanel.js";
 import { openLinkPanel } from "./views/linkPanel.js";
@@ -15,7 +16,11 @@ async function main() {
     </div>
     <main class="app-main">
       <div id="editor" class="empty-state-wrap">
-        <p class="empty-state">Connect to OBS, then Grab Last Replay (or press the hotkey) to start trimming.</p>
+        <div class="empty-state-stack">
+          <p class="empty-state" id="empty-msg">One button gets everything ready: OBS connection, Replay Buffer, and where replays appear.</p>
+          <button id="setup-btn" class="btn btn-primary btn-big">Set Up Everything</button>
+          <p class="hint">Then press the hotkey (Ctrl+Shift+R) or Grab Last Replay whenever something clip-worthy happens.</p>
+        </div>
       </div>
     </main>
   `;
@@ -39,7 +44,7 @@ async function main() {
       onLink: handleLink,
       onSettings: () =>
         openSettingsPanel(async () => {
-          await applyHotkey();
+          await applyHotkeys();
           await refreshLinkStatus();
         }),
     });
@@ -49,7 +54,8 @@ async function main() {
     openLinkPanel(refreshLinkStatus);
   }
 
-  /// The target source is "linked" when it's set AND actually exists in OBS.
+  /// The target (overlay or media source) is "linked" when it's set AND
+  /// actually exists in OBS.
   async function refreshLinkStatus() {
     const config = await api.getConfig();
     let linked = false;
@@ -58,9 +64,8 @@ async function main() {
       status.sourceText = "Not linked";
     } else if (status.obsState === "connected") {
       try {
-        const sources = await api.listMediaSources();
-        if (sources.includes(config.target_source)) {
-          linked = true;
+        linked = await api.checkTargetExists();
+        if (linked) {
           status.sourceState = "connected";
           status.sourceText = config.target_source;
         } else {
@@ -79,7 +84,57 @@ async function main() {
     renderHeader();
   }
 
+  /// One-button setup: connect -> start Replay Buffer if off -> open the
+  /// Link dialog if no playback target exists yet.
+  async function handleSetup() {
+    const emptyMsg = document.getElementById("empty-msg");
+    const note = (text) => {
+      if (emptyMsg) emptyMsg.textContent = text;
+    };
+    note("Setting up — connecting to OBS…");
+    try {
+      const report = await api.ensureReady();
+      status.obsState = "connected";
+      status.obsText = "Connected";
+      await refreshLinkStatus();
+      if (!report.linked) {
+        note("Connected, Replay Buffer running. Last step: pick where replays appear.");
+        openLinkPanel(async () => {
+          await refreshLinkStatus();
+          note("All set! Press Ctrl+Shift+R (or Grab Last Replay) whenever something clip-worthy happens.");
+        });
+      } else if (report.bufferStartedNow) {
+        note("All set — the Replay Buffer was off, so I just started it. Give it a few seconds to record, then grab away.");
+      } else {
+        note("All set! Press Ctrl+Shift+R (or Grab Last Replay) whenever something clip-worthy happens.");
+      }
+    } catch (e) {
+      note(`Setup hit a snag: ${e}`);
+      status.obsState = "error";
+      status.obsText = String(e);
+      renderHeader();
+    }
+  }
+
   document.getElementById("link-btn").addEventListener("click", handleLink);
+  document.getElementById("setup-btn").addEventListener("click", handleSetup);
+
+  // Confirm before quitting — the hotkey and overlay stop working while
+  // the app is closed, so an accidental X shouldn't kill it silently.
+  const appWindow = window.__TAURI__.window.getCurrentWindow();
+  appWindow.onCloseRequested((event) => {
+    event.preventDefault();
+    const { close } = openModal(`
+      <h2>Quit ReplayTrim?</h2>
+      <p class="hint">The grab hotkey and the on-stream overlay stop working while the app is closed.</p>
+      <div class="modal-actions">
+        <button id="quit-cancel" class="btn btn-ghost">Cancel</button>
+        <button id="quit-confirm" class="btn btn-danger">Quit</button>
+      </div>
+    `);
+    document.getElementById("quit-cancel").addEventListener("click", close);
+    document.getElementById("quit-confirm").addEventListener("click", () => appWindow.destroy());
+  });
 
   async function handleConnect() {
     status.obsState = "connecting";
@@ -115,24 +170,53 @@ async function main() {
     }
   }
 
-  async function applyHotkey() {
-    const config = await api.getConfig();
-    if (registeredHotkey) {
-      await unregister(registeredHotkey).catch(() => {});
-      registeredHotkey = null;
+  async function handleInstant() {
+    try {
+      const path = await api.instantReplay();
+      editorEl.className = "";
+      await renderTrimEditor(editorEl, path);
+    } catch (e) {
+      editorEl.className = "empty-state-wrap";
+      editorEl.innerHTML = `<p class="empty-state">Instant replay failed: ${e}</p>`;
     }
-    if (config.grab_hotkey) {
+  }
+
+  let registeredHotkeys = [];
+
+  async function applyHotkeys() {
+    const config = await api.getConfig();
+    for (const combo of registeredHotkeys) {
+      await unregister(combo).catch(() => {});
+    }
+    registeredHotkeys = [];
+
+    const bindings = [
+      [config.grab_hotkey, () => handleGrab()],
+      [config.instant_hotkey, () => handleInstant()],
+      [config.replay_hotkey, () => api.overlayCommand("replay").catch(() => {})],
+      [config.hide_hotkey, () => api.overlayCommand("hide").catch(() => {})],
+    ];
+    for (const [combo, handler] of bindings) {
+      if (!combo) continue;
       try {
-        await register(config.grab_hotkey, () => handleGrab());
-        registeredHotkey = config.grab_hotkey;
+        await register(combo, handler);
+        registeredHotkeys.push(combo);
       } catch (e) {
-        console.error("Failed to register hotkey", e);
+        console.error(`Failed to register hotkey ${combo}`, e);
       }
     }
   }
 
   renderHeader();
-  await applyHotkey();
+  await applyHotkeys();
+
+  // Dock buttons reach the app as Tauri events from the local server.
+  const { listen } = window.__TAURI__.event;
+  await listen("dock-grab", () => handleGrab());
+  await listen("clip-grabbed", async (event) => {
+    editorEl.className = "";
+    await renderTrimEditor(editorEl, event.payload);
+  });
 
   // Auto-connect on launch when OBS credentials are already saved, so the
   // global hotkey works immediately without opening the app window.

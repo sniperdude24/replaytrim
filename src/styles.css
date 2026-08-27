@@ -137,6 +137,20 @@ h2 {
 
 .empty-state { color: var(--text-dim); font-size: 0.9rem; }
 
+.empty-state-stack {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 1rem;
+  text-align: center;
+  max-width: 480px;
+}
+
+.btn-big {
+  font-size: 1.05rem;
+  padding: 0.7rem 1.6rem;
+}
+
 /* Buttons */
 
 .btn {
@@ -172,12 +186,17 @@ h2 {
   margin: 0 auto;
 }
 
+/* Sized to the clip's own aspect ratio (no forced box = no black side
+   bars); JS sets aspect-ratio from the video's real dimensions. */
 #preview {
-  width: 100%;
+  display: block;
+  width: auto;
+  height: auto;
+  max-width: 100%;
   max-height: 360px;
+  margin: 0 auto 0.75rem;
   background: black;
   border-radius: 8px;
-  margin-bottom: 0.75rem;
 }
 
 .scrubber {

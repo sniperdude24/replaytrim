@@ -96,6 +96,55 @@ impl ObsClient {
         Ok(())
     }
 
+    pub async fn get_replay_buffer_active(&self) -> anyhow::Result<bool> {
+        let data = self.call("GetReplayBufferStatus", json!({})).await?;
+        Ok(data["outputActive"].as_bool().unwrap_or(false))
+    }
+
+    pub async fn start_replay_buffer(&self) -> anyhow::Result<()> {
+        self.call("StartReplayBuffer", json!({})).await?;
+        Ok(())
+    }
+
+    /// Canvas base resolution, for sizing the overlay browser source.
+    pub async fn get_canvas_size(&self) -> anyhow::Result<(u32, u32)> {
+        let data = self.call("GetVideoSettings", json!({})).await?;
+        Ok((
+            data["baseWidth"].as_u64().unwrap_or(1920) as u32,
+            data["baseHeight"].as_u64().unwrap_or(1080) as u32,
+        ))
+    }
+
+    /// Creates the on-stream overlay: a Browser Source filling the canvas,
+    /// pointed at our local overlay server. The page is transparent until a
+    /// clip plays, so it can stay visible permanently.
+    pub async fn create_browser_source(
+        &self,
+        scene: &str,
+        name: &str,
+        url: &str,
+        width: u32,
+        height: u32,
+    ) -> anyhow::Result<()> {
+        self.call(
+            "CreateInput",
+            json!({
+                "sceneName": scene,
+                "inputName": name,
+                "inputKind": "browser_source",
+                "inputSettings": {
+                    "url": url,
+                    "width": width,
+                    "height": height,
+                    "shutdown": false,
+                    "restart_when_active": false
+                }
+            }),
+        )
+        .await?;
+        Ok(())
+    }
+
     pub async fn get_last_replay_buffer_replay(&self) -> anyhow::Result<String> {
         let data = self.call("GetLastReplayBufferReplay", json!({})).await?;
         Ok(data["savedReplayPath"].as_str().unwrap_or_default().to_string())
@@ -149,6 +198,15 @@ impl ObsClient {
             self.set_scene_item_enabled(scene, item_id, false).await?;
         }
         Ok(())
+    }
+
+    /// True if any input (of any kind) has this name.
+    pub async fn input_exists(&self, name: &str) -> anyhow::Result<bool> {
+        let data = self.call("GetInputList", json!({})).await?;
+        Ok(data["inputs"]
+            .as_array()
+            .map(|arr| arr.iter().any(|i| i["inputName"] == name))
+            .unwrap_or(false))
     }
 
     /// Finds every (scene, sceneItemId) pair the source appears in.

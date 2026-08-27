@@ -57,6 +57,9 @@ export async function renderTrimEditor(container, replayPath, onSent) {
   video.addEventListener("loadedmetadata", () => {
     duration = video.duration || 0;
     durationLabel.textContent = `${duration.toFixed(2)}s total`;
+    if (video.videoWidth && video.videoHeight) {
+      video.style.aspectRatio = `${video.videoWidth} / ${video.videoHeight}`;
+    }
     renderScrubber();
   });
 

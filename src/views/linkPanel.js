@@ -16,26 +16,35 @@ export async function openLinkPanel(onLinked) {
     sources = await api.listMediaSources();
   } catch {}
 
+  const sceneOptions = sceneList.scenes
+    .map(
+      (s) =>
+        `<option value="${escapeHtml(s)}" ${s === sceneList.current ? "selected" : ""}>${escapeHtml(s)}${s === sceneList.current ? " (current)" : ""}</option>`
+    )
+    .join("");
+
   const { close } = openModal(`
     <h2>Link to OBS</h2>
-    <p class="hint">Trimmed clips play through a Media Source inside OBS. Create one below —
-    it shows up in the scene you pick, and you can move and resize it in OBS like any other source.
-    It stays invisible until a clip is playing.</p>
+    <p class="hint">Pick how replays show up in your stream. The overlay player is invisible
+    until a clip plays, fades out when it ends, and has on-video controls (play/pause/restart/hide)
+    you can click through OBS's Interact window.</p>
     <form id="link-form">
       <fieldset>
-        <legend>Create a new source (recommended)</legend>
+        <legend>Overlay player (recommended)</legend>
         <label>Put it in this scene
-          <select id="scene-select">
-            ${sceneList.scenes
-              .map(
-                (s) =>
-                  `<option value="${escapeHtml(s)}" ${s === sceneList.current ? "selected" : ""}>${escapeHtml(s)}${s === sceneList.current ? " (current)" : ""}</option>`
-              )
-              .join("")}
-          </select>
+          <select id="overlay-scene-select">${sceneOptions}</select>
+        </label>
+        <label>Overlay name <input id="overlay-name" value="ReplayTrim Overlay"></label>
+        <button type="button" id="create-overlay-btn" class="btn btn-primary">Create Overlay &amp; Link</button>
+        <p class="hint">Fills the whole scene, video letterboxed inside. Resize/move it in OBS if you want it smaller.</p>
+      </fieldset>
+      <fieldset>
+        <legend>Or a plain Media Source</legend>
+        <label>Put it in this scene
+          <select id="scene-select">${sceneOptions}</select>
         </label>
         <label>Source name <input id="new-source-name" value="ReplayTrim Replay"></label>
-        <button type="button" id="create-source-btn" class="btn btn-primary">Create in OBS &amp; Link</button>
+        <button type="button" id="create-source-btn" class="btn">Create in OBS &amp; Link</button>
       </fieldset>
       ${
         sources.length
@@ -55,6 +64,27 @@ export async function openLinkPanel(onLinked) {
   `);
 
   const msg = document.getElementById("link-msg");
+
+  document.getElementById("create-overlay-btn").addEventListener("click", async () => {
+    const sceneName = document.getElementById("overlay-scene-select").value;
+    const sourceName = document.getElementById("overlay-name").value.trim();
+    if (!sceneName) {
+      msg.textContent = "No scene selected — are you connected to OBS?";
+      return;
+    }
+    if (!sourceName) {
+      msg.textContent = "Give the overlay a name.";
+      return;
+    }
+    msg.textContent = "Creating overlay in OBS…";
+    try {
+      await api.createObsOverlay(sceneName, sourceName);
+      close();
+      onLinked?.();
+    } catch (e) {
+      msg.textContent = `Failed: ${e}`;
+    }
+  });
 
   document.getElementById("create-source-btn").addEventListener("click", async () => {
     const sceneName = document.getElementById("scene-select").value;
@@ -82,6 +112,7 @@ export async function openLinkPanel(onLinked) {
     try {
       const config = await api.getConfig();
       config.target_source = sourceName;
+      config.target_kind = "media_source";
       await api.saveConfig(config);
       close();
       onLinked?.();

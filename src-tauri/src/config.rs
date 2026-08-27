@@ -12,8 +12,20 @@ pub struct Config {
     pub obs_password: String,
     #[serde(default)]
     pub target_source: String,
+    /// "overlay" (browser-source overlay player) or "media_source".
+    #[serde(default = "default_target_kind")]
+    pub target_kind: String,
     #[serde(default = "default_hotkey")]
     pub grab_hotkey: String,
+    /// Optional extra keybinds; empty string = unbound.
+    #[serde(default)]
+    pub instant_hotkey: String,
+    #[serde(default)]
+    pub replay_hotkey: String,
+    #[serde(default)]
+    pub hide_hotkey: String,
+    #[serde(default = "default_overlay_port")]
+    pub overlay_port: u16,
 }
 
 fn default_host() -> String {
@@ -25,6 +37,12 @@ fn default_port() -> u16 {
 fn default_hotkey() -> String {
     "CommandOrControl+Shift+R".into()
 }
+fn default_target_kind() -> String {
+    "media_source".into()
+}
+fn default_overlay_port() -> u16 {
+    8930
+}
 
 impl Default for Config {
     fn default() -> Self {
@@ -33,7 +51,12 @@ impl Default for Config {
             obs_port: default_port(),
             obs_password: String::new(),
             target_source: String::new(),
+            target_kind: default_target_kind(),
             grab_hotkey: default_hotkey(),
+            instant_hotkey: String::new(),
+            replay_hotkey: String::new(),
+            hide_hotkey: String::new(),
+            overlay_port: default_overlay_port(),
         }
     }
 }

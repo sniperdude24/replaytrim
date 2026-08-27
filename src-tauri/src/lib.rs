@@ -2,6 +2,7 @@ mod commands;
 mod config;
 mod ffmpeg;
 mod obs_client;
+mod overlay_server;
 mod state;
 
 use state::AppState;
@@ -15,7 +16,13 @@ pub fn run() {
         .setup(|app| {
             let handle = app.handle().clone();
             let config = config::load(&handle).unwrap_or_default();
-            app.manage(AppState::new(config));
+            let state = AppState::new(config.clone());
+            app.manage(state.clone());
+            tauri::async_runtime::spawn(async move {
+                if let Err(e) = overlay_server::spawn(handle, state, config.overlay_port).await {
+                    eprintln!("failed to start overlay server: {e}");
+                }
+            });
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
@@ -25,6 +32,11 @@ pub fn run() {
             commands::list_media_sources,
             commands::list_scenes,
             commands::create_obs_source,
+            commands::create_obs_overlay,
+            commands::ensure_ready,
+            commands::check_target_exists,
+            commands::instant_replay,
+            commands::overlay_command,
             commands::read_file_bytes,
             commands::grab_replay,
             commands::generate_waveform,

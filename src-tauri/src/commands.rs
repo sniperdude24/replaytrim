@@ -75,14 +75,133 @@ pub async fn create_obs_source(
     }
     let mut config = state.config.lock().await;
     config.target_source = source_name;
+    config.target_kind = "media_source".into();
     crate::config::save(&app, &config).map_err(|e| e.to_string())?;
     Ok(())
 }
 
-/// Retroactively grabs the last N seconds (whatever OBS's Replay Buffer is
-/// configured for) by triggering a save and waiting for a new file to appear.
+/// Creates the on-stream overlay Browser Source in the given scene and makes
+/// it the playback target.
 #[tauri::command]
-pub async fn grab_replay(state: State<'_, Arc<AppState>>) -> Result<String, String> {
+pub async fn create_obs_overlay(
+    app: AppHandle,
+    state: State<'_, Arc<AppState>>,
+    scene_name: String,
+    source_name: String,
+) -> Result<(), String> {
+    let port = state.config.lock().await.overlay_port;
+    let url = format!("http://127.0.0.1:{port}/overlay");
+    {
+        let guard = state.obs.lock().await;
+        let client = guard.as_ref().ok_or("Not connected to OBS")?;
+        let (w, h) = client.get_canvas_size().await.map_err(|e| e.to_string())?;
+        client
+            .create_browser_source(&scene_name, &source_name, &url, w, h)
+            .await
+            .map_err(|e| e.to_string())?;
+    }
+    let mut config = state.config.lock().await;
+    config.target_source = source_name;
+    config.target_kind = "overlay".into();
+    crate::config::save(&app, &config).map_err(|e| e.to_string())?;
+    Ok(())
+}
+
+/// True when the configured playback target (overlay or media source)
+/// actually exists in OBS right now.
+#[tauri::command]
+pub async fn check_target_exists(state: State<'_, Arc<AppState>>) -> Result<bool, String> {
+    let config = state.config.lock().await.clone();
+    if config.target_source.is_empty() {
+        return Ok(false);
+    }
+    let guard = state.obs.lock().await;
+    let client = guard.as_ref().ok_or("Not connected to OBS")?;
+    client
+        .input_exists(&config.target_source)
+        .await
+        .map_err(|e| e.to_string())
+}
+
+#[derive(serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ReadyReport {
+    pub connected: bool,
+    pub buffer_active: bool,
+    pub buffer_started_now: bool,
+    pub linked: bool,
+    pub target_kind: String,
+    pub target_source: String,
+}
+
+/// The one-button setup chain: connect -> ensure the Replay Buffer is
+/// running -> report whether a playback target is linked (the frontend opens
+/// the Link dialog when it isn't).
+#[tauri::command]
+pub async fn ensure_ready(state: State<'_, Arc<AppState>>) -> Result<ReadyReport, String> {
+    let config = state.config.lock().await.clone();
+
+    // 1. Connect if we aren't already.
+    {
+        let mut guard = state.obs.lock().await;
+        if guard.is_none() {
+            let client =
+                ObsClient::connect(&config.obs_host, config.obs_port, &config.obs_password)
+                    .await
+                    .map_err(|e| format!("Could not connect to OBS: {e}"))?;
+            *guard = Some(client);
+        }
+    }
+
+    let guard = state.obs.lock().await;
+    let client = guard.as_ref().ok_or("Not connected to OBS")?;
+
+    // 2. Replay Buffer running?
+    let was_active = client
+        .get_replay_buffer_active()
+        .await
+        .map_err(|e| e.to_string())?;
+    if !was_active {
+        client
+            .start_replay_buffer()
+            .await
+            .map_err(|e| format!("Could not start the Replay Buffer (is it configured in OBS Settings → Output?): {e}"))?;
+    }
+
+    // 3. Playback target linked?
+    let linked = if config.target_source.is_empty() {
+        false
+    } else {
+        client
+            .input_exists(&config.target_source)
+            .await
+            .unwrap_or(false)
+    };
+
+    Ok(ReadyReport {
+        connected: true,
+        buffer_active: true,
+        buffer_started_now: !was_active,
+        linked,
+        target_kind: config.target_kind.clone(),
+        target_source: config.target_source.clone(),
+    })
+}
+
+/// Grab core, shared by the tauri command, the dock, and instant replay:
+/// checks the buffer, triggers a save, and waits for the new file.
+pub(crate) async fn do_grab(state: &AppState) -> Result<String, String> {
+    {
+        let guard = state.obs.lock().await;
+        let client = guard.as_ref().ok_or("Not connected to OBS")?;
+        if !client.get_replay_buffer_active().await.unwrap_or(false) {
+            let _ = client.start_replay_buffer().await;
+            return Err(
+                "The Replay Buffer was off — I just started it. Give it a few seconds to record, then grab again.".into(),
+            );
+        }
+    }
+
     let previous = {
         let guard = state.obs.lock().await;
         let client = guard.as_ref().ok_or("Not connected to OBS")?;
@@ -112,6 +231,58 @@ pub async fn grab_replay(state: State<'_, Arc<AppState>>) -> Result<String, Stri
         }
     }
     Err("Timed out waiting for OBS to save the replay buffer".into())
+}
+
+/// Retroactively grabs the last N seconds (whatever OBS's Replay Buffer is
+/// configured for) by triggering a save and waiting for a new file to appear.
+#[tauri::command]
+pub async fn grab_replay(state: State<'_, Arc<AppState>>) -> Result<String, String> {
+    do_grab(&state).await
+}
+
+/// Sends a clip straight to the overlay page (fade in, play, fade out).
+pub(crate) async fn push_clip_to_overlay(state: &AppState, file_path: &str) {
+    let mut overlay = state.overlay.lock().await;
+    overlay.clip_path = Some(std::path::PathBuf::from(file_path));
+    overlay.generation += 1;
+}
+
+/// One keypress: grab the whole buffer and play it immediately, no trim
+/// step — through the overlay when linked to one, otherwise through the
+/// media source. Returns the grabbed path so the UI can also load it for
+/// optional re-trimming.
+pub(crate) async fn do_instant(state: &Arc<AppState>) -> Result<String, String> {
+    let config = state.config.lock().await.clone();
+    if config.target_source.is_empty() {
+        return Err("Not linked to OBS yet — open Link to OBS in the app first".into());
+    }
+    let path = do_grab(state).await?;
+    if config.target_kind == "overlay" {
+        push_clip_to_overlay(state, &path).await;
+    } else {
+        let duration =
+            crate::ffmpeg::probe_duration(std::path::Path::new(&path)).unwrap_or(180.0);
+        push_clip_to_media_source(state, &path, duration).await?;
+    }
+    Ok(path)
+}
+
+#[tauri::command]
+pub async fn instant_replay(state: State<'_, Arc<AppState>>) -> Result<String, String> {
+    do_instant(state.inner()).await
+}
+
+/// Overlay playback control ("replay" | "pause" | "hide") for hotkeys and
+/// the in-app UI; the dock posts to the HTTP equivalent.
+#[tauri::command]
+pub async fn overlay_command(
+    state: State<'_, Arc<AppState>>,
+    action: String,
+) -> Result<(), String> {
+    let mut overlay = state.overlay.lock().await;
+    overlay.cmd_seq += 1;
+    overlay.cmd = Some(action);
+    Ok(())
 }
 
 /// Reads a local file's bytes so the frontend can build a Blob URL for
@@ -199,6 +370,25 @@ pub async fn push_to_obs(
     if config.target_source.is_empty() {
         return Err("Not linked to OBS yet — click the \"Plays through\" pill (or the Link to OBS banner) to set up a source".into());
     }
+
+    // Overlay path: just tell the overlay page about the new clip — it
+    // fades in, plays, and fades out on end all by itself.
+    if config.target_kind == "overlay" {
+        push_clip_to_overlay(&state, &file_path).await;
+        return Ok(());
+    }
+
+    push_clip_to_media_source(state.inner(), &file_path, duration_secs).await
+}
+
+/// Media-source playback sequence, shared by trimmed sends and instant
+/// replay: hide -> load -> restart -> reveal -> auto-hide after the clip.
+pub(crate) async fn push_clip_to_media_source(
+    state: &Arc<AppState>,
+    file_path: &str,
+    duration_secs: f64,
+) -> Result<(), String> {
+    let config = state.config.lock().await.clone();
     let gen = state
         .push_gen
         .fetch_add(1, std::sync::atomic::Ordering::SeqCst)
@@ -243,7 +433,7 @@ pub async fn push_to_obs(
         items
     };
 
-    let state_bg = Arc::clone(state.inner());
+    let state_bg = Arc::clone(state);
     tauri::async_runtime::spawn(async move {
         tokio::time::sleep(std::time::Duration::from_secs_f64(duration_secs + 0.7)).await;
         if state_bg.push_gen.load(std::sync::atomic::Ordering::SeqCst) != gen {

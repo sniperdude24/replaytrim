@@ -30,4 +30,5 @@ sha2 = "0.10"
 base64 = "0.22"
 uuid = { version = "1", features = ["v4", "serde"] }
 anyhow = "1"
+axum = "0.7"
 
