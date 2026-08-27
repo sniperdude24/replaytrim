@@ -95,6 +95,30 @@ h2 {
 .pill-label { color: var(--text-dim); }
 .pill-text { max-width: 20rem; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 
+/* Setup banner shown until the app is linked to an OBS Media Source */
+
+.banner {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 1rem;
+  padding: 0.65rem 1.25rem;
+  background: rgba(229, 185, 60, 0.12);
+  border-bottom: 1px solid var(--border);
+  font-size: 0.88rem;
+}
+
+/* Clickable wrapper that makes a status pill act as a button */
+.pill-btn {
+  background: none;
+  border: none;
+  padding: 0;
+  cursor: pointer;
+  font: inherit;
+  color: inherit;
+}
+.pill-btn:hover .pill { border-color: var(--accent); }
+
 /* Main layout */
 
 .app-main {
@@ -162,6 +186,18 @@ h2 {
   margin-bottom: 0.5rem;
 }
 
+/* Faint center baseline so even silent audio shows where the waveform sits */
+.scrubber::after {
+  content: "";
+  position: absolute;
+  left: 0;
+  right: 0;
+  top: 50%;
+  height: 1px;
+  background: rgba(255, 255, 255, 0.22);
+  pointer-events: none;
+}
+
 .waveform-img {
   position: absolute;
   inset: 0;
@@ -185,6 +221,22 @@ h2 {
   border-left: 2px solid var(--accent);
   border-right: 2px solid var(--accent);
 }
+
+.scrubber-playhead {
+  position: absolute;
+  top: 0;
+  bottom: 0;
+  left: 0;
+  width: 2px;
+  background: #fff;
+  opacity: 0.85;
+  pointer-events: none;
+  box-shadow: 0 0 4px rgba(0, 0, 0, 0.6);
+}
+
+.scrub-hint { margin: -0.5rem 0 0.75rem; }
+
+.scrubber-track { cursor: crosshair; }
 
 .scrubber-handle {
   position: absolute;

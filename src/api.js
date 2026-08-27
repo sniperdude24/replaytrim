@@ -5,10 +5,13 @@ export const api = {
   saveConfig: (config) => invoke("save_config", { config }),
   connectObs: () => invoke("connect_obs"),
   listMediaSources: () => invoke("list_media_sources"),
+  listScenes: () => invoke("list_scenes"),
+  createObsSource: (sceneName, sourceName) => invoke("create_obs_source", { sceneName, sourceName }),
   grabReplay: () => invoke("grab_replay"),
   generateWaveform: (inputPath) => invoke("generate_waveform", { inputPath }),
   exportTrim: (inputPath, start, end, fast) => invoke("export_trim", { inputPath, start, end, fast }),
-  pushToObs: (filePath) => invoke("push_to_obs", { filePath }),
+  pushToObs: (filePath, durationSecs) => invoke("push_to_obs", { filePath, durationSecs }),
+  toggleSourceVisible: () => invoke("toggle_source_visible"),
   readFileBytes: (path) => invoke("read_file_bytes", { path }),
 };
 

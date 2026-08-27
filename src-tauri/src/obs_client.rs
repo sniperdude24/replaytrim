@@ -114,12 +114,97 @@ impl ObsClient {
             .collect())
     }
 
+    /// Returns (scene names, current program scene name).
+    pub async fn get_scene_list(&self) -> anyhow::Result<(Vec<String>, String)> {
+        let data = self.call("GetSceneList", json!({})).await?;
+        let current = data["currentProgramSceneName"]
+            .as_str()
+            .unwrap_or_default()
+            .to_string();
+        let scenes = data["scenes"]
+            .as_array()
+            .cloned()
+            .unwrap_or_default()
+            .into_iter()
+            .map(|s| s["sceneName"].as_str().unwrap_or_default().to_string())
+            .collect();
+        Ok((scenes, current))
+    }
+
+    /// Creates the media source hidden — it only becomes visible while a
+    /// clip is actually playing.
+    pub async fn create_media_source(&self, scene: &str, name: &str) -> anyhow::Result<()> {
+        let data = self
+            .call(
+                "CreateInput",
+                json!({
+                    "sceneName": scene,
+                    "inputName": name,
+                    "inputKind": "ffmpeg_source",
+                    "inputSettings": { "looping": false, "is_local_file": true }
+                }),
+            )
+            .await?;
+        if let Some(item_id) = data["sceneItemId"].as_i64() {
+            self.set_scene_item_enabled(scene, item_id, false).await?;
+        }
+        Ok(())
+    }
+
+    /// Finds every (scene, sceneItemId) pair the source appears in.
+    pub async fn find_scene_items(&self, source: &str) -> anyhow::Result<Vec<(String, i64)>> {
+        let (scenes, _) = self.get_scene_list().await?;
+        let mut found = Vec::new();
+        for scene in scenes {
+            if let Ok(data) = self
+                .call(
+                    "GetSceneItemId",
+                    json!({ "sceneName": scene, "sourceName": source }),
+                )
+                .await
+            {
+                if let Some(id) = data["sceneItemId"].as_i64() {
+                    found.push((scene, id));
+                }
+            }
+        }
+        Ok(found)
+    }
+
+    pub async fn set_scene_item_enabled(
+        &self,
+        scene: &str,
+        item_id: i64,
+        enabled: bool,
+    ) -> anyhow::Result<()> {
+        self.call(
+            "SetSceneItemEnabled",
+            json!({
+                "sceneName": scene,
+                "sceneItemId": item_id,
+                "sceneItemEnabled": enabled
+            }),
+        )
+        .await?;
+        Ok(())
+    }
+
+    pub async fn get_scene_item_enabled(&self, scene: &str, item_id: i64) -> anyhow::Result<bool> {
+        let data = self
+            .call(
+                "GetSceneItemEnabled",
+                json!({ "sceneName": scene, "sceneItemId": item_id }),
+            )
+            .await?;
+        Ok(data["sceneItemEnabled"].as_bool().unwrap_or(false))
+    }
+
     pub async fn set_input_file(&self, input_name: &str, file_path: &str) -> anyhow::Result<()> {
         self.call(
             "SetInputSettings",
             json!({
                 "inputName": input_name,
-                "inputSettings": { "local_file": file_path },
+                "inputSettings": { "local_file": file_path, "is_local_file": true },
                 "overlay": true
             }),
         )

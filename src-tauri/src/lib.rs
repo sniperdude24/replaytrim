@@ -23,11 +23,14 @@ pub fn run() {
             commands::save_config,
             commands::connect_obs,
             commands::list_media_sources,
+            commands::list_scenes,
+            commands::create_obs_source,
             commands::read_file_bytes,
             commands::grab_replay,
             commands::generate_waveform,
             commands::export_trim,
             commands::push_to_obs,
+            commands::toggle_source_visible,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
