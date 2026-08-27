@@ -188,6 +188,28 @@ pub async fn ensure_ready(state: State<'_, Arc<AppState>>) -> Result<ReadyReport
     })
 }
 
+/// Appends to the clip library (capped) and persists it.
+pub(crate) async fn record_clip(state: &AppState, path: &str, kind: &str) {
+    let duration = crate::ffmpeg::probe_duration(std::path::Path::new(path)).unwrap_or(0.0);
+    let entry = crate::state::ClipEntry {
+        path: path.to_string(),
+        kind: kind.to_string(),
+        saved_at_epoch: std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0),
+        duration_secs: duration,
+    };
+    let mut clips = state.clips.lock().await;
+    clips.retain(|c| c.path != entry.path);
+    clips.push(entry);
+    let len = clips.len();
+    if len > 20 {
+        clips.drain(0..len - 20);
+    }
+    let _ = crate::config::save_clips(&state.clips_file, &clips);
+}
+
 /// Grab core, shared by the tauri command, the dock, and instant replay:
 /// checks the buffer, triggers a save, and waits for the new file.
 pub(crate) async fn do_grab(state: &AppState) -> Result<String, String> {
@@ -222,10 +244,14 @@ pub(crate) async fn do_grab(state: &AppState) -> Result<String, String> {
 
     for _ in 0..40 {
         tokio::time::sleep(std::time::Duration::from_millis(250)).await;
-        let guard = state.obs.lock().await;
-        let client = guard.as_ref().ok_or("Not connected to OBS")?;
-        if let Ok(path) = client.get_last_replay_buffer_replay().await {
+        let path = {
+            let guard = state.obs.lock().await;
+            let client = guard.as_ref().ok_or("Not connected to OBS")?;
+            client.get_last_replay_buffer_replay().await.ok()
+        };
+        if let Some(path) = path {
             if !path.is_empty() && path != previous {
+                record_clip(state, &path, "grab").await;
                 return Ok(path);
             }
         }
@@ -272,17 +298,118 @@ pub async fn instant_replay(state: State<'_, Arc<AppState>>) -> Result<String, S
     do_instant(state.inner()).await
 }
 
-/// Overlay playback control ("replay" | "pause" | "hide") for hotkeys and
-/// the in-app UI; the dock posts to the HTTP equivalent.
+/// Playback control ("replay" | "pause" | "hide") routed to whichever
+/// target is linked: the overlay page (via its command channel) or the
+/// media source (direct OBS calls — hide must be instant).
+pub(crate) async fn do_playback_command(
+    state: &Arc<AppState>,
+    action: &str,
+) -> Result<(), String> {
+    let config = state.config.lock().await.clone();
+
+    if config.target_kind == "overlay" {
+        let mut overlay = state.overlay.lock().await;
+        overlay.cmd_seq += 1;
+        overlay.cmd = Some(action.to_string());
+        return Ok(());
+    }
+
+    if config.target_source.is_empty() {
+        return Err("Not linked to OBS yet".into());
+    }
+    // Manual control supersedes any pending auto-hide.
+    let gen = state
+        .push_gen
+        .fetch_add(1, std::sync::atomic::Ordering::SeqCst)
+        + 1;
+
+    let guard = state.obs.lock().await;
+    let client = guard.as_ref().ok_or("Not connected to OBS")?;
+    let items = client
+        .find_scene_items(&config.target_source)
+        .await
+        .map_err(|e| e.to_string())?;
+    if items.is_empty() {
+        return Err(format!(
+            "Source \"{}\" isn't in any OBS scene",
+            config.target_source
+        ));
+    }
+
+    match action {
+        "hide" => {
+            // Visibility first — that's the on-screen change — then stop.
+            for (scene, id) in &items {
+                client
+                    .set_scene_item_enabled(scene, *id, false)
+                    .await
+                    .map_err(|e| e.to_string())?;
+            }
+            let _ = client
+                .trigger_media_action(&config.target_source, "STOP")
+                .await;
+        }
+        "pause" => {
+            let (media_state, _) = client
+                .get_media_state(&config.target_source)
+                .await
+                .map_err(|e| e.to_string())?;
+            let next = if media_state == "OBS_MEDIA_STATE_PLAYING" {
+                "PAUSE"
+            } else {
+                "PLAY"
+            };
+            client
+                .trigger_media_action(&config.target_source, next)
+                .await
+                .map_err(|e| e.to_string())?;
+        }
+        "replay" => {
+            client
+                .trigger_media_action(&config.target_source, "RESTART")
+                .await
+                .map_err(|e| e.to_string())?;
+            tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+            for (scene, id) in &items {
+                client
+                    .set_scene_item_enabled(scene, *id, true)
+                    .await
+                    .map_err(|e| e.to_string())?;
+            }
+            // Re-arm the auto-hide using the media's own reported duration.
+            if let Ok((_, Some(duration_ms))) =
+                client.get_media_state(&config.target_source).await
+            {
+                let state_bg = Arc::clone(state);
+                let items_bg = items.clone();
+                tauri::async_runtime::spawn(async move {
+                    tokio::time::sleep(std::time::Duration::from_secs_f64(
+                        duration_ms / 1000.0 + 0.7,
+                    ))
+                    .await;
+                    if state_bg.push_gen.load(std::sync::atomic::Ordering::SeqCst) != gen {
+                        return;
+                    }
+                    let guard = state_bg.obs.lock().await;
+                    if let Some(client) = guard.as_ref() {
+                        for (scene, id) in &items_bg {
+                            let _ = client.set_scene_item_enabled(scene, *id, false).await;
+                        }
+                    }
+                });
+            }
+        }
+        other => return Err(format!("unknown action: {other}")),
+    }
+    Ok(())
+}
+
 #[tauri::command]
 pub async fn overlay_command(
     state: State<'_, Arc<AppState>>,
     action: String,
 ) -> Result<(), String> {
-    let mut overlay = state.overlay.lock().await;
-    overlay.cmd_seq += 1;
-    overlay.cmd = Some(action);
-    Ok(())
+    do_playback_command(state.inner(), &action).await
 }
 
 /// Reads a local file's bytes so the frontend can build a Blob URL for
@@ -322,14 +449,14 @@ pub async fn generate_waveform(
 /// app runs inside an MSIX/AppContainer context, AppData writes are
 /// virtualized into a private store that OBS (outside the container) cannot
 /// see, and playback silently fails.
-#[tauri::command]
-pub async fn export_trim(
-    input_path: String,
+pub(crate) async fn do_export_trim(
+    state: &AppState,
+    input_path: &str,
     start: f64,
     end: f64,
     fast: bool,
 ) -> Result<String, String> {
-    let input = std::path::PathBuf::from(&input_path);
+    let input = std::path::PathBuf::from(input_path);
     let out_dir = input
         .parent()
         .ok_or("Replay file has no parent directory")?;
@@ -342,19 +469,42 @@ pub async fn export_trim(
     let output = out_dir.join(format!("replaytrim_{stamp}.mp4"));
     ffmpeg::trim(&input, &output, start, end, fast).map_err(|e| e.to_string())?;
 
-    // Best-effort cleanup of older exports; a file OBS still holds open just
-    // stays until next time.
+    // Keep the 5 newest exports (they're part of the clip library now);
+    // best-effort delete the rest — a file OBS holds open just stays.
     if let Ok(entries) = std::fs::read_dir(out_dir) {
-        for entry in entries.flatten() {
-            let name = entry.file_name().to_string_lossy().to_string();
-            let is_ours = (name.starts_with("replaytrim_") && name.ends_with(".mp4"))
-                || name == "current_replay.mp4"; // legacy fixed-name export
-            if is_ours && entry.path() != output {
-                let _ = std::fs::remove_file(entry.path());
-            }
+        let mut ours: Vec<(std::time::SystemTime, std::path::PathBuf)> = entries
+            .flatten()
+            .filter_map(|entry| {
+                let name = entry.file_name().to_string_lossy().to_string();
+                let is_ours = (name.starts_with("replaytrim_") && name.ends_with(".mp4"))
+                    || name == "current_replay.mp4"; // legacy fixed-name export
+                if !is_ours || entry.path() == output {
+                    return None;
+                }
+                let modified = entry.metadata().and_then(|m| m.modified()).ok()?;
+                Some((modified, entry.path()))
+            })
+            .collect();
+        ours.sort_by(|a, b| b.0.cmp(&a.0)); // newest first
+        for (_, path) in ours.into_iter().skip(4) {
+            let _ = std::fs::remove_file(path);
         }
     }
-    Ok(output.to_string_lossy().to_string())
+
+    let output_str = output.to_string_lossy().to_string();
+    record_clip(state, &output_str, "trim").await;
+    Ok(output_str)
+}
+
+#[tauri::command]
+pub async fn export_trim(
+    state: State<'_, Arc<AppState>>,
+    input_path: String,
+    start: f64,
+    end: f64,
+    fast: bool,
+) -> Result<String, String> {
+    do_export_trim(&state, &input_path, start, end, fast).await
 }
 
 /// The full replay sequence: hide the source everywhere it appears, load the

@@ -271,15 +271,31 @@ impl ObsClient {
     }
 
     pub async fn restart_media(&self, input_name: &str) -> anyhow::Result<()> {
+        self.trigger_media_action(input_name, "RESTART").await
+    }
+
+    /// action: RESTART | PLAY | PAUSE | STOP
+    pub async fn trigger_media_action(&self, input_name: &str, action: &str) -> anyhow::Result<()> {
         self.call(
             "TriggerMediaInputAction",
             json!({
                 "inputName": input_name,
-                "mediaAction": "OBS_WEBSOCKET_MEDIA_INPUT_ACTION_RESTART"
+                "mediaAction": format!("OBS_WEBSOCKET_MEDIA_INPUT_ACTION_{action}")
             }),
         )
         .await?;
         Ok(())
+    }
+
+    /// (mediaState, duration in ms if known)
+    pub async fn get_media_state(&self, input_name: &str) -> anyhow::Result<(String, Option<f64>)> {
+        let data = self
+            .call("GetMediaInputStatus", json!({ "inputName": input_name }))
+            .await?;
+        Ok((
+            data["mediaState"].as_str().unwrap_or_default().to_string(),
+            data["mediaDuration"].as_f64(),
+        ))
     }
 }
 

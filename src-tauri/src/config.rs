@@ -86,3 +86,26 @@ pub fn work_dir(app: &AppHandle) -> anyhow::Result<PathBuf> {
     std::fs::create_dir_all(&dir)?;
     Ok(dir)
 }
+
+pub fn clips_path(app: &AppHandle) -> anyhow::Result<PathBuf> {
+    let dir = app.path().app_data_dir()?;
+    std::fs::create_dir_all(&dir)?;
+    Ok(dir.join("clips.json"))
+}
+
+/// Loads the clip library, dropping entries whose file no longer exists.
+pub fn load_clips(path: &std::path::Path) -> Vec<crate::state::ClipEntry> {
+    let Ok(text) = std::fs::read_to_string(path) else {
+        return Vec::new();
+    };
+    let entries: Vec<crate::state::ClipEntry> = serde_json::from_str(&text).unwrap_or_default();
+    entries
+        .into_iter()
+        .filter(|e| std::path::Path::new(&e.path).exists())
+        .collect()
+}
+
+pub fn save_clips(path: &std::path::Path, clips: &[crate::state::ClipEntry]) -> anyhow::Result<()> {
+    std::fs::write(path, serde_json::to_string_pretty(clips)?)?;
+    Ok(())
+}

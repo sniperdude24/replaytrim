@@ -30,6 +30,11 @@ pub async fn spawn(
         .route("/dock", get(dock_page))
         .route("/api/state", get(api_state))
         .route("/api/cmd/:action", post(api_cmd))
+        .route("/api/grab", post(api_grab))
+        .route("/api/clips", get(api_clips))
+        .route("/api/file", get(api_file))
+        .route("/api/waveform", get(api_waveform))
+        .route("/api/send_trim", post(api_send_trim))
         .route("/clip", get(serve_clip))
         .with_state(ctx);
 
@@ -72,12 +77,128 @@ async fn api_cmd(
             Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e).into_response(),
         },
         "replay" | "pause" | "hide" => {
-            let mut overlay = ctx.state.overlay.lock().await;
-            overlay.cmd_seq += 1;
-            overlay.cmd = Some(action);
-            (StatusCode::OK, "ok").into_response()
+            match crate::commands::do_playback_command(&ctx.state, &action).await {
+                Ok(()) => (StatusCode::OK, "ok").into_response(),
+                Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e).into_response(),
+            }
         }
         _ => (StatusCode::NOT_FOUND, "unknown action").into_response(),
+    }
+}
+
+/// POST /api/grab — dock-native grab: save the buffer, return the new path.
+async fn api_grab(State(ctx): State<ServerCtx>) -> Response {
+    match crate::commands::do_grab(&ctx.state).await {
+        Ok(path) => {
+            let duration = crate::ffmpeg::probe_duration(std::path::Path::new(&path)).unwrap_or(0.0);
+            let _ = ctx.app.emit("clip-grabbed", path.clone());
+            Json(json!({ "path": path, "durationSecs": duration })).into_response()
+        }
+        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e).into_response(),
+    }
+}
+
+/// GET /api/clips — the clip library, newest first, existing files only.
+async fn api_clips(State(ctx): State<ServerCtx>) -> Json<serde_json::Value> {
+    let clips = ctx.state.clips.lock().await;
+    let list: Vec<_> = clips
+        .iter()
+        .rev()
+        .filter(|c| std::path::Path::new(&c.path).exists())
+        .collect();
+    Json(json!({ "clips": list }))
+}
+
+/// Only files the app itself produced/grabbed (i.e. in the clip library or
+/// currently loaded in the overlay) may be served.
+async fn path_allowed(ctx: &ServerCtx, path: &str) -> bool {
+    let clips = ctx.state.clips.lock().await;
+    if clips.iter().any(|c| c.path == path) {
+        return true;
+    }
+    drop(clips);
+    let overlay = ctx.state.overlay.lock().await;
+    overlay
+        .clip_path
+        .as_ref()
+        .map(|p| p.to_string_lossy() == path)
+        .unwrap_or(false)
+}
+
+#[derive(serde::Deserialize)]
+struct FileQuery {
+    path: String,
+}
+
+/// GET /api/file?path=… — serve a library video with Range support.
+async fn api_file(
+    State(ctx): State<ServerCtx>,
+    axum::extract::Query(q): axum::extract::Query<FileQuery>,
+    headers: HeaderMap,
+) -> Response {
+    if !path_allowed(&ctx, &q.path).await {
+        return (StatusCode::FORBIDDEN, "not a library clip").into_response();
+    }
+    serve_video_file(std::path::Path::new(&q.path), &headers).await
+}
+
+/// GET /api/waveform?path=… — waveform PNG for a library clip.
+async fn api_waveform(
+    State(ctx): State<ServerCtx>,
+    axum::extract::Query(q): axum::extract::Query<FileQuery>,
+) -> Response {
+    if !path_allowed(&ctx, &q.path).await {
+        return (StatusCode::FORBIDDEN, "not a library clip").into_response();
+    }
+    let tmp = std::env::temp_dir().join(format!("replaytrim_wave_{}.png", uuid::Uuid::new_v4()));
+    let result = crate::ffmpeg::generate_waveform(std::path::Path::new(&q.path), &tmp, 1200, 120);
+    let response = match (result, tokio::fs::read(&tmp).await) {
+        (Ok(_), Ok(bytes)) => (
+            StatusCode::OK,
+            [(header::CONTENT_TYPE, "image/png".to_string())],
+            bytes,
+        )
+            .into_response(),
+        (Err(e), _) => (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
+        (_, Err(e)) => (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
+    };
+    let _ = tokio::fs::remove_file(&tmp).await;
+    response
+}
+
+#[derive(serde::Deserialize)]
+struct SendTrimBody {
+    path: String,
+    start: f64,
+    end: f64,
+    #[serde(default)]
+    fast: bool,
+}
+
+/// POST /api/send_trim — export the selection and play it through the
+/// linked target (overlay or media source).
+async fn api_send_trim(State(ctx): State<ServerCtx>, Json(body): Json<SendTrimBody>) -> Response {
+    if !path_allowed(&ctx, &body.path).await {
+        return (StatusCode::FORBIDDEN, "not a library clip").into_response();
+    }
+    let out =
+        match crate::commands::do_export_trim(&ctx.state, &body.path, body.start, body.end, body.fast)
+            .await
+        {
+            Ok(p) => p,
+            Err(e) => return (StatusCode::INTERNAL_SERVER_ERROR, e).into_response(),
+        };
+    let duration = (body.end - body.start).max(0.05);
+    let config = ctx.state.config.lock().await.clone();
+    let result = if config.target_kind == "overlay" {
+        crate::commands::push_clip_to_overlay(&ctx.state, &out).await;
+        Ok(())
+    } else {
+        crate::commands::push_clip_to_media_source(&ctx.state, &out, duration).await
+    };
+    match result {
+        Ok(()) => Json(json!({ "path": out })).into_response(),
+        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e).into_response(),
     }
 }
 
@@ -92,7 +213,11 @@ async fn serve_clip(State(ctx): State<ServerCtx>, headers: HeaderMap) -> Respons
     let Some(path) = path else {
         return (StatusCode::NOT_FOUND, "no clip yet").into_response();
     };
-    let Ok(bytes) = tokio::fs::read(&path).await else {
+    serve_video_file(&path, &headers).await
+}
+
+async fn serve_video_file(path: &std::path::Path, headers: &HeaderMap) -> Response {
+    let Ok(bytes) = tokio::fs::read(path).await else {
         return (StatusCode::NOT_FOUND, "clip file missing").into_response();
     };
     let total = bytes.len();
@@ -159,57 +284,297 @@ async fn dock_page() -> Html<&'static str> {
     Html(DOCK_HTML)
 }
 
-/// The OBS control dock: added once via View → Docks → Custom Browser Docks.
-/// Buttons drive the app and the overlay through /api/cmd/*.
-const DOCK_HTML: &str = r#"<!doctype html>
+/// The OBS control dock: the full grab → trim → send workflow in a dock,
+/// plus playback controls and the recent-clip library.
+const DOCK_HTML: &str = r##"<!doctype html>
 <html>
 <head>
 <meta charset="utf-8">
 <title>ReplayTrim</title>
 <style>
   :root { color-scheme: dark; }
-  html, body { margin: 0; height: 100%; background: #1a1c20; color: #e6e8eb;
-    font-family: "Segoe UI", sans-serif; }
-  #wrap { display: flex; flex-direction: column; gap: 8px; padding: 10px; }
+  * { box-sizing: border-box; }
+  html, body { margin: 0; background: #1a1c20; color: #e6e8eb;
+    font-family: "Segoe UI", sans-serif; font-size: 13px; }
+  #wrap { display: flex; flex-direction: column; gap: 8px; padding: 8px; }
+  .row { display: flex; gap: 6px; flex-wrap: wrap; }
   button {
-    font: 600 14px "Segoe UI", sans-serif; color: #fff; cursor: pointer;
-    background: #2a2d34; border: 1px solid #3a3e46; border-radius: 8px;
-    padding: 12px 10px; text-align: left;
+    font: 600 12.5px "Segoe UI", sans-serif; color: #fff; cursor: pointer;
+    background: #2a2d34; border: 1px solid #3a3e46; border-radius: 7px;
+    padding: 8px 10px;
   }
   button:hover { border-color: #4f8cff; }
   button.primary { background: #4f8cff; border-color: #4f8cff; }
-  #status { font-size: 12px; color: #9aa0aa; padding: 2px 2px 0; min-height: 16px; }
+  button:disabled { opacity: .5; cursor: default; }
+  #status { font-size: 11.5px; color: #9aa0aa; min-height: 15px; }
+
+  #editor { display: none; flex-direction: column; gap: 6px; }
+  #editor.active { display: flex; }
+  #preview { width: 100%; max-height: 220px; background: #000; border-radius: 6px; display: block; }
+  #editor.collapsed #preview { display: none; }
+
+  #scrubber { position: relative; height: 64px; }
+  #scrubber::after { content: ""; position: absolute; left: 0; right: 0; top: 50%;
+    height: 1px; background: rgba(255,255,255,.22); pointer-events: none; }
+  #waveform { position: absolute; inset: 0; width: 100%; height: 100%;
+    object-fit: fill; border-radius: 5px; background: #22252b; }
+  #track { position: absolute; inset: 0; cursor: crosshair; }
+  #selection { position: absolute; top: 0; bottom: 0;
+    background: rgba(79,140,255,.25); border-left: 2px solid #4f8cff; border-right: 2px solid #4f8cff; }
+  #playhead { position: absolute; top: 0; bottom: 0; left: 0; width: 2px;
+    background: #fff; opacity: .85; pointer-events: none; }
+  .handle { position: absolute; top: 0; bottom: 0; width: 12px; margin-left: -6px;
+    background: #4f8cff; cursor: ew-resize; border-radius: 3px; touch-action: none; }
+  #times { display: flex; justify-content: space-between; font-family: Consolas, monospace;
+    font-size: 11px; color: #9aa0aa; }
+  .inline { display: flex; align-items: center; gap: 6px; font-size: 11.5px; color: #9aa0aa; }
+
+  #clips { display: flex; flex-direction: column; gap: 4px; }
+  .clip-row { display: flex; align-items: center; gap: 8px; padding: 6px 8px;
+    background: #22252b; border: 1px solid #33363d; border-radius: 6px; cursor: pointer; }
+  .clip-row:hover { border-color: #4f8cff; }
+  .clip-row .meta { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .clip-row .badge { font-size: 10px; padding: 1px 6px; border-radius: 999px;
+    background: #33363d; color: #9aa0aa; flex: none; }
+  .clip-row .badge.trim { background: rgba(62,201,138,.2); color: #3ec98a; }
+  .clip-row button { padding: 4px 9px; flex: none; }
+  h3 { margin: 4px 0 0; font-size: 11px; text-transform: uppercase;
+    letter-spacing: .05em; color: #9aa0aa; }
 </style>
 </head>
 <body>
 <div id="wrap">
-  <button class="primary" data-cmd="grab">🎬 Grab &amp; Trim <span style="font-weight:400;opacity:.75">— opens in ReplayTrim</span></button>
-  <button class="primary" data-cmd="instant">⚡ Instant Replay <span style="font-weight:400;opacity:.75">— play whole buffer now</span></button>
-  <button data-cmd="replay">🔁 Replay Again</button>
-  <button data-cmd="pause">⏯ Pause / Resume</button>
-  <button data-cmd="hide">🚫 Hide Replay</button>
+  <div class="row">
+    <button class="primary" id="grab-btn">🎬 Grab &amp; Trim</button>
+    <button class="primary" data-cmd="instant">⚡ Instant Replay</button>
+  </div>
+  <div class="row">
+    <button data-cmd="replay">🔁 Replay</button>
+    <button data-cmd="pause">⏯ Pause</button>
+    <button data-cmd="hide">🚫 Hide</button>
+  </div>
   <div id="status"></div>
+
+  <div id="editor">
+    <div class="row" style="justify-content: space-between; align-items: center;">
+      <span class="inline" id="clip-name" style="overflow:hidden;text-overflow:ellipsis;white-space:nowrap;max-width:60%"></span>
+      <button id="toggle-preview">▤ Hide preview</button>
+    </div>
+    <video id="preview" playsinline></video>
+    <div id="scrubber">
+      <img id="waveform" alt="">
+      <div id="track">
+        <div id="selection"></div>
+        <div id="playhead"></div>
+        <div class="handle" id="h-start" data-handle="start"></div>
+        <div class="handle" id="h-end" data-handle="end"></div>
+      </div>
+    </div>
+    <div id="times"><span id="t-start">0.00s</span><span id="t-total"></span><span id="t-end">0.00s</span></div>
+    <div class="row" style="align-items:center">
+      <label class="inline"><input type="checkbox" id="fast" checked> fast trim</label>
+      <button id="preview-sel">Preview</button>
+      <button class="primary" id="send-btn" style="margin-left:auto">Send &amp; Play</button>
+    </div>
+  </div>
+
+  <h3>Recent clips</h3>
+  <div id="clips"><span class="inline">None yet — grab something!</span></div>
 </div>
 <script>
   const status = document.getElementById("status");
+  const editor = document.getElementById("editor");
+  const v = document.getElementById("preview");
+  const waveform = document.getElementById("waveform");
+  const track = document.getElementById("track");
+  const selection = document.getElementById("selection");
+  const playhead = document.getElementById("playhead");
+  const hStart = document.getElementById("h-start");
+  const hEnd = document.getElementById("h-end");
+  const tStart = document.getElementById("t-start");
+  const tEnd = document.getElementById("t-end");
+  const tTotal = document.getElementById("t-total");
+
+  let clipPath = null, duration = 0, startPct = 0, endPct = 1;
+
+  function note(text, sticky) {
+    status.textContent = text;
+    if (!sticky) setTimeout(() => { if (status.textContent === text) status.textContent = ""; }, 5000);
+  }
+
+  // ---- simple command buttons ----
   document.querySelectorAll("button[data-cmd]").forEach((btn) => {
     btn.addEventListener("click", async () => {
-      const cmd = btn.dataset.cmd;
-      status.textContent = "…";
+      note("…", true);
       try {
-        const res = await fetch("/api/cmd/" + cmd, { method: "POST" });
-        const text = await res.text();
-        status.textContent = res.ok ? "✓ " + text : "✗ " + text;
-      } catch (e) {
-        status.textContent = "✗ ReplayTrim app is not running";
-      }
-      setTimeout(() => { if (status.textContent) status.textContent = ""; }, 4000);
+        const res = await fetch("/api/cmd/" + btn.dataset.cmd, { method: "POST" });
+        note((res.ok ? "✓ " : "✗ ") + (await res.text()));
+      } catch { note("✗ ReplayTrim app is not running"); }
     });
   });
+
+  // ---- collapse toggle (remembered) ----
+  const toggleBtn = document.getElementById("toggle-preview");
+  function setCollapsed(collapsed) {
+    editor.classList.toggle("collapsed", collapsed);
+    toggleBtn.textContent = collapsed ? "▤ Show preview" : "▤ Hide preview";
+    try { localStorage.setItem("rt-collapsed", collapsed ? "1" : ""); } catch {}
+  }
+  toggleBtn.addEventListener("click", () => setCollapsed(!editor.classList.contains("collapsed")));
+  try { if (localStorage.getItem("rt-collapsed") === "1") setCollapsed(true); } catch {}
+
+  // ---- load a clip into the editor ----
+  async function loadClip(path) {
+    clipPath = path;
+    startPct = 0; endPct = 1; duration = 0;
+    editor.classList.add("active");
+    document.getElementById("clip-name").textContent = path.split(/[\\/]/).pop();
+    v.src = "/api/file?path=" + encodeURIComponent(path);
+    waveform.src = "/api/waveform?path=" + encodeURIComponent(path);
+    render();
+  }
+
+  v.addEventListener("loadedmetadata", () => {
+    duration = v.duration || 0;
+    tTotal.textContent = duration.toFixed(2) + "s total";
+    render();
+  });
+
+  function render() {
+    hStart.style.left = (startPct * 100) + "%";
+    hEnd.style.left = (endPct * 100) + "%";
+    selection.style.left = (startPct * 100) + "%";
+    selection.style.width = ((endPct - startPct) * 100) + "%";
+    tStart.textContent = (startPct * duration).toFixed(2) + "s";
+    tEnd.textContent = (endPct * duration).toFixed(2) + "s";
+  }
+
+  // ---- scrubber (same interaction model as the desktop app) ----
+  let dragging = null;
+  const pctFromEvent = (e) => {
+    const r = track.getBoundingClientRect();
+    return Math.min(1, Math.max(0, (e.clientX - r.left) / r.width));
+  };
+  const seek = (pct) => { if (duration) { v.pause(); v.currentTime = pct * duration; } };
+  [hStart, hEnd].forEach((h) => h.addEventListener("pointerdown", (e) => {
+    dragging = e.target.dataset.handle;
+    e.target.setPointerCapture(e.pointerId);
+    seek(dragging === "start" ? startPct : endPct);
+    e.stopPropagation();
+  }));
+  window.addEventListener("pointermove", (e) => {
+    if (!dragging || dragging === "seek") return;
+    const pct = pctFromEvent(e);
+    if (dragging === "start") startPct = Math.min(pct, endPct - 0.01);
+    else endPct = Math.max(pct, startPct + 0.01);
+    seek(dragging === "start" ? startPct : endPct);
+    render();
+  });
+  window.addEventListener("pointerup", () => (dragging = null));
+  track.addEventListener("pointerdown", (e) => {
+    if (e.target === hStart || e.target === hEnd) return;
+    dragging = "seek";
+    track.setPointerCapture(e.pointerId);
+    seek(pctFromEvent(e));
+  });
+  track.addEventListener("pointermove", (e) => { if (dragging === "seek") seek(pctFromEvent(e)); });
+  function tickPlayhead() {
+    if (duration) playhead.style.left = ((v.currentTime / duration) * 100) + "%";
+    requestAnimationFrame(tickPlayhead);
+  }
+  tickPlayhead();
+
+  document.getElementById("preview-sel").addEventListener("click", () => {
+    v.currentTime = startPct * duration;
+    v.play();
+    const stop = () => {
+      if (v.currentTime >= endPct * duration) { v.pause(); v.removeEventListener("timeupdate", stop); }
+    };
+    v.addEventListener("timeupdate", stop);
+  });
+
+  // ---- grab ----
+  const grabBtn = document.getElementById("grab-btn");
+  grabBtn.addEventListener("click", async () => {
+    grabBtn.disabled = true;
+    note("Grabbing…", true);
+    try {
+      const res = await fetch("/api/grab", { method: "POST" });
+      if (!res.ok) { note("✗ " + (await res.text())); return; }
+      const data = await res.json();
+      await loadClip(data.path);
+      note("✓ grabbed — trim away");
+      refreshClips();
+    } catch { note("✗ ReplayTrim app is not running"); }
+    finally { grabBtn.disabled = false; }
+  });
+
+  // ---- send ----
+  const sendBtn = document.getElementById("send-btn");
+  sendBtn.addEventListener("click", async () => {
+    if (!clipPath) return;
+    sendBtn.disabled = true;
+    note("Trimming & sending…", true);
+    try {
+      const res = await fetch("/api/send_trim", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          path: clipPath,
+          start: startPct * duration,
+          end: endPct * duration,
+          fast: document.getElementById("fast").checked,
+        }),
+      });
+      note(res.ok ? "✓ playing on stream" : "✗ " + (await res.text()));
+      if (res.ok) refreshClips();
+    } catch { note("✗ send failed"); }
+    finally { sendBtn.disabled = false; }
+  });
+
+  // ---- clip library ----
+  function ago(epoch) {
+    const s = Math.max(0, Math.floor(Date.now() / 1000 - epoch));
+    if (s < 60) return s + "s ago";
+    if (s < 3600) return Math.floor(s / 60) + "m ago";
+    if (s < 86400) return Math.floor(s / 3600) + "h ago";
+    return Math.floor(s / 86400) + "d ago";
+  }
+  async function refreshClips() {
+    try {
+      const res = await fetch("/api/clips");
+      const data = await res.json();
+      const box = document.getElementById("clips");
+      if (!data.clips.length) { box.innerHTML = '<span class="inline">None yet — grab something!</span>'; return; }
+      box.innerHTML = "";
+      data.clips.slice(0, 8).forEach((c) => {
+        const row = document.createElement("div");
+        row.className = "clip-row";
+        const badge = '<span class="badge ' + (c.kind === "trim" ? "trim" : "") + '">' + c.kind + "</span>";
+        row.innerHTML = badge +
+          '<span class="meta">' + ago(c.savedAtEpoch) + " · " + c.durationSecs.toFixed(1) + "s</span>" +
+          '<button title="Play on stream as-is">▶</button>';
+        row.addEventListener("click", () => loadClip(c.path));
+        row.querySelector("button").addEventListener("click", async (e) => {
+          e.stopPropagation();
+          note("Sending…", true);
+          const res = await fetch("/api/send_trim", {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ path: c.path, start: 0, end: c.durationSecs, fast: true }),
+          }).catch(() => null);
+          note(res && res.ok ? "✓ playing on stream" : "✗ send failed");
+        });
+        box.appendChild(row);
+      });
+    } catch { /* app offline */ }
+  }
+  refreshClips();
+  setInterval(refreshClips, 5000);
 </script>
 </body>
 </html>
-"#;
+"##;
 
 /// The overlay itself: transparent page, full-viewport video, controls that
 /// only appear while the mouse moves over the page (i.e. when the streamer
@@ -223,6 +588,8 @@ const OVERLAY_HTML: &str = r#"<!doctype html>
   html, body { margin: 0; height: 100%; background: transparent; overflow: hidden; }
   #wrap { position: fixed; inset: 0; opacity: 0; transition: opacity 0.4s ease; }
   #wrap.visible { opacity: 1; }
+  /* Explicit hide command = instant cut, no lingering fade */
+  #wrap.instant { transition: none; }
   video { width: 100%; height: 100%; object-fit: contain; background: transparent; }
   #controls {
     position: fixed; left: 50%; bottom: 4%; transform: translateX(-50%);
@@ -275,11 +642,16 @@ const OVERLAY_HTML: &str = r#"<!doctype html>
     wrap.classList.add("visible");
     v.play();
   });
-  document.getElementById("hide").addEventListener("click", () => {
-    v.pause();
-    wrap.classList.remove("visible");
-  });
+  document.getElementById("hide").addEventListener("click", hideNow);
   v.addEventListener("ended", () => wrap.classList.remove("visible"));
+
+  function hideNow() {
+    v.pause();
+    wrap.classList.add("instant");
+    wrap.classList.remove("visible");
+    // restore the fade for future natural clip-endings
+    requestAnimationFrame(() => requestAnimationFrame(() => wrap.classList.remove("instant")));
+  }
 
   function applyCommand(cmd) {
     if (cmd === "replay") {
@@ -290,8 +662,7 @@ const OVERLAY_HTML: &str = r#"<!doctype html>
     } else if (cmd === "pause") {
       if (v.paused) { v.play().catch(() => {}); } else { v.pause(); }
     } else if (cmd === "hide") {
-      v.pause();
-      wrap.classList.remove("visible");
+      hideNow();
     }
   }
 
@@ -316,7 +687,7 @@ const OVERLAY_HTML: &str = r#"<!doctype html>
         if (!skip && s.cmd) applyCommand(s.cmd);
       }
     } catch (e) { /* app not running; keep polling quietly */ }
-    setTimeout(poll, 500);
+    setTimeout(poll, 150);
   }
   poll();
 </script>

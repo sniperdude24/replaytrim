@@ -16,7 +16,10 @@ pub fn run() {
         .setup(|app| {
             let handle = app.handle().clone();
             let config = config::load(&handle).unwrap_or_default();
-            let state = AppState::new(config.clone());
+            let clips_file = config::clips_path(&handle)
+                .unwrap_or_else(|_| std::path::PathBuf::from("clips.json"));
+            let clips = config::load_clips(&clips_file);
+            let state = AppState::new(config.clone(), clips, clips_file);
             app.manage(state.clone());
             tauri::async_runtime::spawn(async move {
                 if let Err(e) = overlay_server::spawn(handle, state, config.overlay_port).await {
