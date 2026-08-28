@@ -7,6 +7,7 @@ export async function renderTrimEditor(container, replayPath, onSent) {
         <h2>Trim</h2>
         <span class="clip-path" title="${replayPath}">${replayPath.split(/[\\/]/).pop()}</span>
       </div>
+      <div class="trim-stack">
       <video id="preview" controls></video>
       <div class="scrubber" id="scrubber">
         <img id="waveform-img" class="waveform-img" alt="waveform">
@@ -21,6 +22,7 @@ export async function renderTrimEditor(container, replayPath, onSent) {
         <span id="start-label">0.00s</span>
         <span id="duration-label"></span>
         <span id="end-label">0.00s</span>
+      </div>
       </div>
       <p class="hint scrub-hint">Drag the blue handles to trim — the video follows so you see the exact frame. Click anywhere on the waveform to jump there.</p>
       <div class="trim-footer">
@@ -54,12 +56,24 @@ export async function renderTrimEditor(container, replayPath, onSent) {
   let startPct = 0;
   let endPct = 1;
 
+  // The video+waveform stack is sized to the displayed frame width so the
+  // trim handles line up exactly with the video's edges.
+  const trimStack = container.querySelector(".trim-stack");
+  function sizeStack() {
+    if (!video.videoWidth || !video.videoHeight) return;
+    const avail = container.clientWidth || 900;
+    const w = Math.min(avail, 360 * (video.videoWidth / video.videoHeight));
+    trimStack.style.width = `${Math.max(200, Math.round(w))}px`;
+  }
+  window.addEventListener("resize", sizeStack);
+
   video.addEventListener("loadedmetadata", () => {
     duration = video.duration || 0;
     durationLabel.textContent = `${duration.toFixed(2)}s total`;
     if (video.videoWidth && video.videoHeight) {
       video.style.aspectRatio = `${video.videoWidth} / ${video.videoHeight}`;
     }
+    sizeStack();
     renderScrubber();
   });
 

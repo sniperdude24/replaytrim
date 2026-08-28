@@ -186,15 +186,21 @@ h2 {
   margin: 0 auto;
 }
 
-/* Sized to the clip's own aspect ratio (no forced box = no black side
-   bars); JS sets aspect-ratio from the video's real dimensions. */
+/* Video, waveform, and time labels share one stack sized to the displayed
+   video frame, so the trim handles line up with the video's edges. */
+.trim-stack {
+  display: flex;
+  flex-direction: column;
+  width: 100%;
+  margin: 0 auto;
+  min-width: 0;
+}
+
 #preview {
   display: block;
-  width: auto;
+  width: 100%;
   height: auto;
-  max-width: 100%;
-  max-height: 360px;
-  margin: 0 auto 0.75rem;
+  margin: 0 0 0.75rem;
   background: black;
   border-radius: 8px;
 }

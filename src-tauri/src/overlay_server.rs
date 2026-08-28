@@ -459,8 +459,11 @@ const DOCK_HTML: &str = r##"<!doctype html>
 
   #editor { display: none; flex-direction: column; gap: 6px; }
   #editor.active { display: flex; }
-  #preview { width: 100%; max-height: 220px; background: #000; border-radius: 6px; display: block; }
+  #trim-stack { display: flex; flex-direction: column; gap: 6px; width: 100%;
+    margin: 0 auto; min-width: 0; }
+  #preview { width: 100%; background: #000; border-radius: 6px; display: block; }
   #editor.collapsed #preview { display: none; }
+  #editor.collapsed #trim-stack { width: 100%; }
 
   #scrubber { position: relative; height: 64px; }
   #scrubber::after { content: ""; position: absolute; left: 0; right: 0; top: 50%;
@@ -511,22 +514,24 @@ const DOCK_HTML: &str = r##"<!doctype html>
     <span data-tab="folder-section">Folder</span>
   </div>
 
-  <div id="editor" class="tab-section tab-active"
+  <div id="editor" class="tab-section tab-active">
     <div class="row" style="justify-content: space-between; align-items: center;">
       <span class="inline" id="clip-name" style="overflow:hidden;text-overflow:ellipsis;white-space:nowrap;max-width:60%"></span>
       <button id="toggle-preview">▤ Hide preview</button>
     </div>
-    <video id="preview" playsinline></video>
-    <div id="scrubber">
-      <img id="waveform" alt="">
-      <div id="track">
-        <div id="selection"></div>
-        <div id="playhead"></div>
-        <div class="handle" id="h-start" data-handle="start"></div>
-        <div class="handle" id="h-end" data-handle="end"></div>
+    <div id="trim-stack">
+      <video id="preview" playsinline></video>
+      <div id="scrubber">
+        <img id="waveform" alt="">
+        <div id="track">
+          <div id="selection"></div>
+          <div id="playhead"></div>
+          <div class="handle" id="h-start" data-handle="start"></div>
+          <div class="handle" id="h-end" data-handle="end"></div>
+        </div>
       </div>
+      <div id="times"><span id="t-start">0.00s</span><span id="t-total"></span><span id="t-end">0.00s</span></div>
     </div>
-    <div id="times"><span id="t-start">0.00s</span><span id="t-total"></span><span id="t-end">0.00s</span></div>
     <div class="row" style="align-items:center">
       <label class="inline"><input type="checkbox" id="fast" checked> fast trim</label>
       <button id="preview-sel">Preview</button>
@@ -605,10 +610,17 @@ const DOCK_HTML: &str = r##"<!doctype html>
     layoutBtn.textContent = stacked ? "⇆ Tabs" : "⇆ Stacked";
     const capPx = (listLimit * 31 + 6) + "px";
     if (stacked) {
-      document.getElementById("editor").style.display =
-        document.getElementById("editor").classList.contains("active") ? "flex" : "none";
+      const ed = document.getElementById("editor");
+      ed.style.display = ed.classList.contains("active") ? "flex" : "none";
+      // The editor may not push the lists off the (unscrollable) page:
+      // it yields space and scrolls internally when the dock is short.
+      ed.style.flex = "0 1 auto";
+      ed.style.minHeight = "0";
+      ed.style.overflowY = "auto";
       clipsSection.style.display = "flex";
+      clipsSection.style.flex = "none";
       folderSection.style.display = folderOpen ? "flex" : "none";
+      folderSection.style.flex = "none";
       folderBtn.style.display = "";
       [clipsBox, folderBox].forEach((b) => { b.style.maxHeight = capPx; b.style.flex = ""; });
     } else {
@@ -624,6 +636,7 @@ const DOCK_HTML: &str = r##"<!doctype html>
     }
     tabbar.querySelectorAll("span").forEach((s) =>
       s.classList.toggle("active", s.dataset.tab === currentTab));
+    sizeStack();
   }
   layoutBtn.addEventListener("click", () => {
     layout = layout === "stacked" ? "tabbed" : "stacked";
@@ -639,6 +652,7 @@ const DOCK_HTML: &str = r##"<!doctype html>
     editor.classList.toggle("collapsed", collapsed);
     toggleBtn.textContent = collapsed ? "▤ Show preview" : "▤ Hide preview";
     try { localStorage.setItem("rt-collapsed", collapsed ? "1" : ""); } catch {}
+    sizeStack();
   }
   toggleBtn.addEventListener("click", () => setCollapsed(!editor.classList.contains("collapsed")));
   try { if (localStorage.getItem("rt-collapsed") === "1") setCollapsed(true); } catch {}
@@ -656,9 +670,28 @@ const DOCK_HTML: &str = r##"<!doctype html>
     render();
   }
 
+  // Size the video+waveform stack to the DISPLAYED video frame width so the
+  // trim handles line up with the frame edges (no letterbox overhang).
+  const trimStack = document.getElementById("trim-stack");
+  function sizeStack() {
+    const collapsed = editor.classList.contains("collapsed");
+    if (collapsed || !v.videoWidth || !v.videoHeight) {
+      trimStack.style.width = "100%";
+      return;
+    }
+    if (!window.innerHeight) return; // hidden dock reports 0x0 — keep last size
+    const maxH = Math.min(220, window.innerHeight * (layout === "tabbed" ? 0.45 : 0.26));
+    const avail = editor.clientWidth || wrap.clientWidth;
+    const w = Math.min(avail, maxH * v.videoWidth / v.videoHeight);
+    trimStack.style.width = Math.max(120, Math.round(w)) + "px";
+  }
+  window.addEventListener("resize", sizeStack);
+
   v.addEventListener("loadedmetadata", () => {
     duration = v.duration || 0;
     tTotal.textContent = duration.toFixed(2) + "s total";
+    if (v.videoWidth && v.videoHeight) v.style.aspectRatio = v.videoWidth + " / " + v.videoHeight;
+    sizeStack();
     render();
   });
 
