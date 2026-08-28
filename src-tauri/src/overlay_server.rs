@@ -102,13 +102,14 @@ async fn api_grab(State(ctx): State<ServerCtx>) -> Response {
 
 /// GET /api/clips — the clip library, newest first, existing files only.
 async fn api_clips(State(ctx): State<ServerCtx>) -> Json<serde_json::Value> {
+    let list_limit = ctx.state.config.lock().await.clip_list_limit;
     let clips = ctx.state.clips.lock().await;
     let list: Vec<_> = clips
         .iter()
         .rev()
         .filter(|c| std::path::Path::new(&c.path).exists())
         .collect();
-    Json(json!({ "clips": list }))
+    Json(json!({ "clips": list, "listLimit": list_limit }))
 }
 
 /// Files the app may serve/act on: library clips, the currently loaded
@@ -141,7 +142,7 @@ async fn path_allowed(ctx: &ServerCtx, path: &str) -> bool {
     let record_dir = ctx.state.record_dir.lock().await;
     record_dir
         .as_ref()
-        .map(|dir| same_dir(parent, dir))
+        .map(|dir| same_dir(parent, dir) || same_dir(parent, &dir.join("ReplayTrim")))
         .unwrap_or(false)
 }
 
@@ -157,8 +158,18 @@ fn same_dir(a: &std::path::Path, b: &std::path::Path) -> bool {
     norm(a) == norm(b)
 }
 
-/// GET /api/folder — every .mp4 in the OBS recording folder, newest first.
-async fn api_folder(State(ctx): State<ServerCtx>) -> Response {
+#[derive(serde::Deserialize)]
+struct FolderQuery {
+    #[serde(default)]
+    which: Option<String>,
+}
+
+/// GET /api/folder?which=clips|recordings — .mp4s in the ReplayTrim
+/// subfolder (default) or the OBS recording folder root, newest first.
+async fn api_folder(
+    State(ctx): State<ServerCtx>,
+    axum::extract::Query(q): axum::extract::Query<FolderQuery>,
+) -> Response {
     // Resolve the recording folder: ask OBS, fall back to the newest
     // library clip's parent. Cache it for the allow-list.
     let mut dir: Option<std::path::PathBuf> = None;
@@ -178,10 +189,22 @@ async fn api_folder(State(ctx): State<ServerCtx>) -> Response {
             .last()
             .and_then(|c| std::path::Path::new(&c.path).parent().map(|p| p.to_path_buf()));
     }
-    let Some(dir) = dir else {
+    let Some(mut dir) = dir else {
         return (StatusCode::NOT_FOUND, "Recording folder unknown — grab a clip first").into_response();
     };
+    // Cache the ROOT recording dir for the allow-list; a "clips" request
+    // then lists its ReplayTrim subfolder.
+    if dir.file_name().and_then(|n| n.to_str()) == Some("ReplayTrim") {
+        if let Some(p) = dir.parent() {
+            dir = p.to_path_buf();
+        }
+    }
     *ctx.state.record_dir.lock().await = Some(dir.clone());
+    if q.which.as_deref() != Some("recordings") {
+        dir = dir.join("ReplayTrim");
+        let _ = std::fs::create_dir_all(&dir);
+    }
+    let list_limit = ctx.state.config.lock().await.clip_list_limit;
 
     let mut files: Vec<(u64, u64, String, String)> = Vec::new(); // (mtime, size, name, path)
     if let Ok(entries) = std::fs::read_dir(&dir) {
@@ -213,7 +236,7 @@ async fn api_folder(State(ctx): State<ServerCtx>) -> Response {
             json!({ "modifiedEpoch": mtime, "sizeMb": (size as f64 / 1048576.0), "name": name, "path": path })
         })
         .collect();
-    Json(json!({ "dir": dir.to_string_lossy(), "files": list })).into_response()
+    Json(json!({ "dir": dir.to_string_lossy(), "files": list, "listLimit": list_limit })).into_response()
 }
 
 /// POST /api/delete — removes a clip from the library AND from disk.
@@ -407,9 +430,22 @@ const DOCK_HTML: &str = r##"<!doctype html>
 <style>
   :root { color-scheme: dark; }
   * { box-sizing: border-box; }
-  html, body { margin: 0; background: #1a1c20; color: #e6e8eb;
-    font-family: "Segoe UI", sans-serif; font-size: 13px; }
-  #wrap { display: flex; flex-direction: column; gap: 8px; padding: 8px; }
+  html, body { margin: 0; height: 100%; overflow: hidden; background: #1a1c20;
+    color: #e6e8eb; font-family: "Segoe UI", sans-serif; font-size: 13px; }
+  #wrap { display: flex; flex-direction: column; gap: 8px; padding: 8px; height: 100vh; }
+  .list-box { overflow-y: auto; min-height: 0; }
+  .list-box::-webkit-scrollbar { width: 8px; }
+  .list-box::-webkit-scrollbar-thumb { background: #3a3e46; border-radius: 4px; }
+
+  #tabbar { display: none; border-bottom: 1px solid #33363d; gap: 2px; }
+  #tabbar span { padding: 5px 12px; cursor: pointer; color: #9aa0aa; font-size: 12.5px;
+    border-bottom: 2px solid transparent; }
+  #tabbar span.active { color: #6ea8ff; border-bottom-color: #4f8cff; }
+  .pill-sm { font-size: 10.5px; padding: 2px 8px; border-radius: 999px; cursor: pointer;
+    background: #2a2d34; border: 1px solid #3a3e46; color: #9aa0aa; }
+  .pill-sm.active { background: rgba(79,140,255,.2); border-color: #4f8cff; color: #6ea8ff; }
+
+  #wrap.tabbed #preview { max-height: 45vh; }
   .row { display: flex; gap: 6px; flex-wrap: wrap; }
   button {
     font: 600 12.5px "Segoe UI", sans-serif; color: #fff; cursor: pointer;
@@ -465,10 +501,17 @@ const DOCK_HTML: &str = r##"<!doctype html>
     <button data-cmd="replay">🔁 Replay</button>
     <button data-cmd="pause">⏯ Pause</button>
     <button data-cmd="hide">🚫 Hide</button>
+    <button id="layout-btn" title="Switch dock layout" style="margin-left:auto">⇆ Tabs</button>
   </div>
   <div id="status"></div>
 
-  <div id="editor">
+  <div id="tabbar">
+    <span data-tab="editor" class="active">Trim</span>
+    <span data-tab="clips-section">Clips</span>
+    <span data-tab="folder-section">Folder</span>
+  </div>
+
+  <div id="editor" class="tab-section tab-active"
     <div class="row" style="justify-content: space-between; align-items: center;">
       <span class="inline" id="clip-name" style="overflow:hidden;text-overflow:ellipsis;white-space:nowrap;max-width:60%"></span>
       <button id="toggle-preview">▤ Hide preview</button>
@@ -491,14 +534,21 @@ const DOCK_HTML: &str = r##"<!doctype html>
     </div>
   </div>
 
-  <div class="row" style="justify-content: space-between; align-items: baseline;">
-    <h3>Recent clips</h3>
-    <button id="folder-btn" style="padding:3px 8px;font-size:11px">📂 Browse folder</button>
+  <div id="clips-section" class="tab-section" style="display:flex;flex-direction:column;gap:4px;min-height:0">
+    <div class="row" style="justify-content: space-between; align-items: baseline;">
+      <h3>Recent clips</h3>
+      <button id="folder-btn" style="padding:3px 8px;font-size:11px">📂 Browse folder</button>
+    </div>
+    <div id="clips" class="list-box"><span class="inline">None yet — grab something!</span></div>
   </div>
-  <div id="clips"><span class="inline">None yet — grab something!</span></div>
-  <div id="folder-section" style="display:none">
-    <h3 id="folder-title">Folder</h3>
-    <div id="folder-files"></div>
+  <div id="folder-section" class="tab-section" style="display:none;flex-direction:column;gap:4px;min-height:0">
+    <div class="row" style="align-items:center;gap:6px">
+      <h3 style="margin:0">Folder</h3>
+      <span class="pill-sm active" data-which="clips">ReplayTrim clips</span>
+      <span class="pill-sm" data-which="recordings">Recordings</span>
+    </div>
+    <p id="folder-title" style="font-size:10.5px;color:#9aa0aa;margin:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap"></p>
+    <div id="folder-files" class="list-box"></div>
   </div>
 </div>
 <script>
@@ -533,6 +583,56 @@ const DOCK_HTML: &str = r##"<!doctype html>
     });
   });
 
+  // ---- layout: stacked vs tabbed (remembered) ----
+  const wrap = document.getElementById("wrap");
+  const clipsSection = document.getElementById("clips-section");
+  const folderSection = document.getElementById("folder-section");
+  const clipsBox = document.getElementById("clips");
+  const folderBox = document.getElementById("folder-files");
+  const tabbar = document.getElementById("tabbar");
+  const folderBtn = document.getElementById("folder-btn");
+  const layoutBtn = document.getElementById("layout-btn");
+  let layout = "stacked";
+  try { layout = localStorage.getItem("rt-layout") || "stacked"; } catch {}
+  let currentTab = "editor";
+  let folderOpen = false;
+  let listLimit = 5;
+
+  function applyView() {
+    const stacked = layout === "stacked";
+    wrap.classList.toggle("tabbed", !stacked);
+    tabbar.style.display = stacked ? "none" : "flex";
+    layoutBtn.textContent = stacked ? "⇆ Tabs" : "⇆ Stacked";
+    const capPx = (listLimit * 31 + 6) + "px";
+    if (stacked) {
+      document.getElementById("editor").style.display =
+        document.getElementById("editor").classList.contains("active") ? "flex" : "none";
+      clipsSection.style.display = "flex";
+      folderSection.style.display = folderOpen ? "flex" : "none";
+      folderBtn.style.display = "";
+      [clipsBox, folderBox].forEach((b) => { b.style.maxHeight = capPx; b.style.flex = ""; });
+    } else {
+      folderBtn.style.display = "none";
+      const map = { "editor": document.getElementById("editor"), "clips-section": clipsSection, "folder-section": folderSection };
+      for (const [id, el] of Object.entries(map)) {
+        const show = id === currentTab;
+        el.style.display = show ? "flex" : "none";
+        if (show && id !== "editor") { el.style.flex = "1"; el.style.minHeight = "0"; }
+      }
+      [clipsBox, folderBox].forEach((b) => { b.style.maxHeight = "none"; b.style.flex = "1"; });
+      if (currentTab === "folder-section") refreshFolder(true);
+    }
+    tabbar.querySelectorAll("span").forEach((s) =>
+      s.classList.toggle("active", s.dataset.tab === currentTab));
+  }
+  layoutBtn.addEventListener("click", () => {
+    layout = layout === "stacked" ? "tabbed" : "stacked";
+    try { localStorage.setItem("rt-layout", layout); } catch {}
+    applyView();
+  });
+  tabbar.querySelectorAll("span").forEach((s) =>
+    s.addEventListener("click", () => { currentTab = s.dataset.tab; applyView(); }));
+
   // ---- collapse toggle (remembered) ----
   const toggleBtn = document.getElementById("toggle-preview");
   function setCollapsed(collapsed) {
@@ -548,6 +648,8 @@ const DOCK_HTML: &str = r##"<!doctype html>
     clipPath = path;
     startPct = 0; endPct = 1; duration = 0;
     editor.classList.add("active");
+    currentTab = "editor";
+    applyView();
     document.getElementById("clip-name").textContent = path.split(/[\\/]/).pop();
     v.src = "/api/file?path=" + encodeURIComponent(path);
     waveform.src = "/api/waveform?path=" + encodeURIComponent(path);
@@ -715,13 +817,16 @@ const DOCK_HTML: &str = r##"<!doctype html>
     try {
       const res = await fetch("/api/clips");
       const data = await res.json();
-      const box = document.getElementById("clips");
-      if (!data.clips.length) { box.innerHTML = '<span class="inline">None yet — grab something!</span>'; return; }
-      box.innerHTML = "";
-      data.clips.slice(0, 8).forEach((c) => {
+      if (data.listLimit && data.listLimit !== listLimit) {
+        listLimit = data.listLimit;
+        applyView();
+      }
+      if (!data.clips.length) { clipsBox.innerHTML = '<span class="inline">None yet — grab something!</span>'; return; }
+      clipsBox.innerHTML = "";
+      data.clips.forEach((c) => {
         const badge = '<span class="badge ' + (c.kind === "trim" ? "trim" : "") + '">' + c.kind + "</span>";
         const meta = '<span class="meta">' + ago(c.savedAtEpoch) + " · " + c.durationSecs.toFixed(1) + "s</span>";
-        box.appendChild(makeRow(badge + meta, c.path, c.durationSecs, () => { refreshClips(); refreshFolder(); }));
+        clipsBox.appendChild(makeRow(badge + meta, c.path, c.durationSecs, () => { refreshClips(); refreshFolder(true); }));
       });
     } catch { /* app offline */ }
   }
@@ -729,34 +834,46 @@ const DOCK_HTML: &str = r##"<!doctype html>
   setInterval(refreshClips, 5000);
 
   // ---- folder browser ----
-  let folderOpen = false;
-  const folderSection = document.getElementById("folder-section");
-  document.getElementById("folder-btn").addEventListener("click", () => {
+  let folderWhich = "clips";
+  folderBtn.addEventListener("click", () => {
     folderOpen = !folderOpen;
-    folderSection.style.display = folderOpen ? "block" : "none";
-    document.getElementById("folder-btn").textContent = folderOpen ? "📂 Hide folder" : "📂 Browse folder";
-    if (folderOpen) refreshFolder();
+    folderBtn.textContent = folderOpen ? "📂 Hide folder" : "📂 Browse folder";
+    applyView();
+    if (folderOpen) refreshFolder(true);
   });
-  async function refreshFolder() {
-    if (!folderOpen) return;
+  folderSection.querySelectorAll(".pill-sm").forEach((pill) =>
+    pill.addEventListener("click", () => {
+      folderWhich = pill.dataset.which;
+      folderSection.querySelectorAll(".pill-sm").forEach((p) =>
+        p.classList.toggle("active", p === pill));
+      refreshFolder(true);
+    }));
+  async function refreshFolder(force) {
+    const visible = folderOpen || (layout === "tabbed" && currentTab === "folder-section");
+    if (!visible && !force) return;
+    if (!visible) return;
     try {
-      const res = await fetch("/api/folder");
+      const res = await fetch("/api/folder?which=" + folderWhich);
       if (!res.ok) {
-        document.getElementById("folder-files").innerHTML =
-          '<span class="inline">' + (await res.text()) + "</span>";
+        folderBox.innerHTML = '<span class="inline">' + (await res.text()) + "</span>";
         return;
       }
       const data = await res.json();
       document.getElementById("folder-title").textContent = "Saved in: " + data.dir;
-      const box = document.getElementById("folder-files");
-      box.innerHTML = "";
+      folderBox.innerHTML = "";
+      if (!data.files.length) {
+        folderBox.innerHTML = '<span class="inline">No videos here yet.</span>';
+        return;
+      }
       data.files.forEach((f) => {
         const meta = '<span class="meta" title="' + f.name + '">' + f.name + "</span>" +
           '<span class="badge">' + ago(f.modifiedEpoch) + " · " + f.sizeMb.toFixed(0) + "MB</span>";
-        box.appendChild(makeRow(meta, f.path, 0, refreshFolder));
+        folderBox.appendChild(makeRow(meta, f.path, 0, () => refreshFolder(true)));
       });
     } catch { /* app offline */ }
   }
+
+  applyView();
 </script>
 </body>
 </html>

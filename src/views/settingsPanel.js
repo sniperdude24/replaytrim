@@ -41,6 +41,11 @@ export async function openSettingsPanel(onSaved) {
         <p class="hint">Click a field, then press the key combo you want. Backspace clears it. Applies on Save — no restart needed. All keybinds work globally, even in-game.</p>
       </fieldset>
       <fieldset>
+        <legend>Clip Lists</legend>
+        <label>Visible clips before scrolling <input name="clip_list_limit" type="number" min="3" max="30" value="${config.clip_list_limit ?? 5}"></label>
+        <p class="hint">The dock's lists show this many rows; older clips stay reachable by scrolling inside the list.</p>
+      </fieldset>
+      <fieldset>
         <legend>OBS Control Dock</legend>
         <p class="hint">Get these buttons inside OBS: View → Docks → Custom Browser Docks → add<br>
         <code style="user-select:all">http://127.0.0.1:${config.overlay_port ?? 8930}/dock</code></p>
@@ -94,6 +99,7 @@ export async function openSettingsPanel(onSaved) {
       instant_hotkey: data.get("instant_hotkey"),
       replay_hotkey: data.get("replay_hotkey"),
       hide_hotkey: data.get("hide_hotkey"),
+      clip_list_limit: Number(data.get("clip_list_limit")) || 5,
     };
     await api.saveConfig(newConfig);
     close();

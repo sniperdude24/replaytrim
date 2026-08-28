@@ -26,6 +26,9 @@ pub struct Config {
     pub hide_hotkey: String,
     #[serde(default = "default_overlay_port")]
     pub overlay_port: u16,
+    /// How many clip rows the dock lists show before internal scrolling.
+    #[serde(default = "default_clip_list_limit")]
+    pub clip_list_limit: u32,
 }
 
 fn default_host() -> String {
@@ -43,6 +46,9 @@ fn default_target_kind() -> String {
 fn default_overlay_port() -> u16 {
     8930
 }
+fn default_clip_list_limit() -> u32 {
+    5
+}
 
 impl Default for Config {
     fn default() -> Self {
@@ -57,6 +63,7 @@ impl Default for Config {
             replay_hotkey: String::new(),
             hide_hotkey: String::new(),
             overlay_port: default_overlay_port(),
+            clip_list_limit: default_clip_list_limit(),
         }
     }
 }

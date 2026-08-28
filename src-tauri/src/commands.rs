@@ -476,9 +476,18 @@ pub(crate) async fn do_export_trim(
     fast: bool,
 ) -> Result<String, String> {
     let input = std::path::PathBuf::from(input_path);
-    let out_dir = input
+    let parent = input
         .parent()
         .ok_or("Replay file has no parent directory")?;
+    // Trims live in a dedicated "ReplayTrim" subfolder next to the replays.
+    // Re-trimming a trim (input already in that folder) stays there.
+    let out_dir = if parent.file_name().and_then(|n| n.to_str()) == Some("ReplayTrim") {
+        parent.to_path_buf()
+    } else {
+        parent.join("ReplayTrim")
+    };
+    std::fs::create_dir_all(&out_dir).map_err(|e| e.to_string())?;
+    let out_dir = out_dir.as_path();
     // Unique name per export: OBS keeps the previously-played file open, so
     // reusing one fixed name makes the second send fight a live file handle.
     let stamp = std::time::SystemTime::now()
