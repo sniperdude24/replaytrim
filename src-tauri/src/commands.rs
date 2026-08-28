@@ -141,17 +141,8 @@ pub struct ReadyReport {
 pub async fn ensure_ready(state: State<'_, Arc<AppState>>) -> Result<ReadyReport, String> {
     let config = state.config.lock().await.clone();
 
-    // 1. Connect if we aren't already.
-    {
-        let mut guard = state.obs.lock().await;
-        if guard.is_none() {
-            let client =
-                ObsClient::connect(&config.obs_host, config.obs_port, &config.obs_password)
-                    .await
-                    .map_err(|e| format!("Could not connect to OBS: {e}"))?;
-            *guard = Some(client);
-        }
-    }
+    // 1. Connect (or reconnect a dead socket).
+    ensure_obs_alive(&state).await?;
 
     let guard = state.obs.lock().await;
     let client = guard.as_ref().ok_or("Not connected to OBS")?;
@@ -210,17 +201,44 @@ pub(crate) async fn record_clip(state: &AppState, path: &str, kind: &str) {
     let _ = crate::config::save_clips(&state.clips_file, &clips);
 }
 
+/// Makes sure we have a LIVE OBS connection: connects if there is none,
+/// and reconnects if the existing socket is dead (e.g. OBS was restarted —
+/// previously that surfaced as bogus "Replay Buffer was off" errors).
+pub(crate) async fn ensure_obs_alive(state: &AppState) -> Result<(), String> {
+    let alive = {
+        let guard = state.obs.lock().await;
+        match guard.as_ref() {
+            None => false,
+            Some(client) => client.ping().await.is_ok(),
+        }
+    };
+    if alive {
+        return Ok(());
+    }
+    let config = state.config.lock().await.clone();
+    let client = ObsClient::connect(&config.obs_host, config.obs_port, &config.obs_password)
+        .await
+        .map_err(|e| format!("OBS connection lost and reconnect failed — is OBS running? ({e})"))?;
+    *state.obs.lock().await = Some(client);
+    Ok(())
+}
+
 /// Grab core, shared by the tauri command, the dock, and instant replay:
 /// checks the buffer, triggers a save, and waits for the new file.
 pub(crate) async fn do_grab(state: &AppState) -> Result<String, String> {
+    ensure_obs_alive(state).await?;
     {
         let guard = state.obs.lock().await;
         let client = guard.as_ref().ok_or("Not connected to OBS")?;
-        if !client.get_replay_buffer_active().await.unwrap_or(false) {
-            let _ = client.start_replay_buffer().await;
-            return Err(
-                "The Replay Buffer was off — I just started it. Give it a few seconds to record, then grab again.".into(),
-            );
+        match client.get_replay_buffer_active().await {
+            Ok(true) => {}
+            Ok(false) => {
+                let _ = client.start_replay_buffer().await;
+                return Err(
+                    "The Replay Buffer was off — I just started it. Give it a few seconds to record, then grab again.".into(),
+                );
+            }
+            Err(e) => return Err(format!("Could not check the Replay Buffer: {e}")),
         }
     }
 
@@ -317,6 +335,7 @@ pub(crate) async fn do_playback_command(
     if config.target_source.is_empty() {
         return Err("Not linked to OBS yet".into());
     }
+    ensure_obs_alive(state).await?;
     // Manual control supersedes any pending auto-hide.
     let gen = state
         .push_gen
@@ -538,6 +557,7 @@ pub(crate) async fn push_clip_to_media_source(
     file_path: &str,
     duration_secs: f64,
 ) -> Result<(), String> {
+    ensure_obs_alive(state).await?;
     let config = state.config.lock().await.clone();
     let gen = state
         .push_gen

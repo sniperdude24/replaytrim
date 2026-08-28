@@ -96,6 +96,20 @@ impl ObsClient {
         Ok(())
     }
 
+    /// Cheap liveness check for the websocket connection.
+    pub async fn ping(&self) -> anyhow::Result<()> {
+        self.call("GetVersion", json!({})).await?;
+        Ok(())
+    }
+
+    pub async fn get_record_directory(&self) -> anyhow::Result<String> {
+        let data = self.call("GetRecordDirectory", json!({})).await?;
+        Ok(data["recordDirectory"]
+            .as_str()
+            .unwrap_or_default()
+            .to_string())
+    }
+
     pub async fn get_replay_buffer_active(&self) -> anyhow::Result<bool> {
         let data = self.call("GetReplayBufferStatus", json!({})).await?;
         Ok(data["outputActive"].as_bool().unwrap_or(false))

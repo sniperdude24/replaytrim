@@ -38,6 +38,9 @@ pub struct AppState {
     /// Recent clips (grabs + trims), newest last; persisted to clips_file.
     pub clips: Mutex<Vec<ClipEntry>>,
     pub clips_file: std::path::PathBuf,
+    /// OBS's recording directory, cached after the first lookup — used to
+    /// allow-list folder browsing.
+    pub record_dir: Mutex<Option<std::path::PathBuf>>,
 }
 
 impl AppState {
@@ -53,6 +56,7 @@ impl AppState {
             overlay: Mutex::new(OverlayState::default()),
             clips: Mutex::new(clips),
             clips_file,
+            record_dir: Mutex::new(None),
         })
     }
 }

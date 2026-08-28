@@ -32,6 +32,8 @@ pub async fn spawn(
         .route("/api/cmd/:action", post(api_cmd))
         .route("/api/grab", post(api_grab))
         .route("/api/clips", get(api_clips))
+        .route("/api/folder", get(api_folder))
+        .route("/api/delete", post(api_delete))
         .route("/api/file", get(api_file))
         .route("/api/waveform", get(api_waveform))
         .route("/api/send_trim", post(api_send_trim))
@@ -109,20 +111,131 @@ async fn api_clips(State(ctx): State<ServerCtx>) -> Json<serde_json::Value> {
     Json(json!({ "clips": list }))
 }
 
-/// Only files the app itself produced/grabbed (i.e. in the clip library or
-/// currently loaded in the overlay) may be served.
+/// Files the app may serve/act on: library clips, the currently loaded
+/// overlay clip, or any .mp4 sitting directly in the OBS recording folder.
 async fn path_allowed(ctx: &ServerCtx, path: &str) -> bool {
-    let clips = ctx.state.clips.lock().await;
-    if clips.iter().any(|c| c.path == path) {
-        return true;
+    {
+        let clips = ctx.state.clips.lock().await;
+        if clips.iter().any(|c| c.path == path) {
+            return true;
+        }
     }
-    drop(clips);
-    let overlay = ctx.state.overlay.lock().await;
-    overlay
-        .clip_path
+    {
+        let overlay = ctx.state.overlay.lock().await;
+        if overlay
+            .clip_path
+            .as_ref()
+            .map(|p| p.to_string_lossy() == path)
+            .unwrap_or(false)
+        {
+            return true;
+        }
+    }
+    let p = std::path::Path::new(path);
+    if p.extension().and_then(|e| e.to_str()) != Some("mp4") {
+        return false;
+    }
+    let Some(parent) = p.parent() else {
+        return false;
+    };
+    let record_dir = ctx.state.record_dir.lock().await;
+    record_dir
         .as_ref()
-        .map(|p| p.to_string_lossy() == path)
+        .map(|dir| same_dir(parent, dir))
         .unwrap_or(false)
+}
+
+/// Case/separator-insensitive directory comparison (Windows paths mix
+/// slashes freely).
+fn same_dir(a: &std::path::Path, b: &std::path::Path) -> bool {
+    let norm = |p: &std::path::Path| {
+        p.to_string_lossy()
+            .replace('/', "\\")
+            .trim_end_matches('\\')
+            .to_lowercase()
+    };
+    norm(a) == norm(b)
+}
+
+/// GET /api/folder — every .mp4 in the OBS recording folder, newest first.
+async fn api_folder(State(ctx): State<ServerCtx>) -> Response {
+    // Resolve the recording folder: ask OBS, fall back to the newest
+    // library clip's parent. Cache it for the allow-list.
+    let mut dir: Option<std::path::PathBuf> = None;
+    if crate::commands::ensure_obs_alive(&ctx.state).await.is_ok() {
+        let guard = ctx.state.obs.lock().await;
+        if let Some(client) = guard.as_ref() {
+            if let Ok(d) = client.get_record_directory().await {
+                if !d.is_empty() {
+                    dir = Some(std::path::PathBuf::from(d));
+                }
+            }
+        }
+    }
+    if dir.is_none() {
+        let clips = ctx.state.clips.lock().await;
+        dir = clips
+            .last()
+            .and_then(|c| std::path::Path::new(&c.path).parent().map(|p| p.to_path_buf()));
+    }
+    let Some(dir) = dir else {
+        return (StatusCode::NOT_FOUND, "Recording folder unknown — grab a clip first").into_response();
+    };
+    *ctx.state.record_dir.lock().await = Some(dir.clone());
+
+    let mut files: Vec<(u64, u64, String, String)> = Vec::new(); // (mtime, size, name, path)
+    if let Ok(entries) = std::fs::read_dir(&dir) {
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.extension().and_then(|e| e.to_str()) != Some("mp4") {
+                continue;
+            }
+            let Ok(meta) = entry.metadata() else { continue };
+            let mtime = meta
+                .modified()
+                .ok()
+                .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+                .map(|d| d.as_secs())
+                .unwrap_or(0);
+            files.push((
+                mtime,
+                meta.len(),
+                entry.file_name().to_string_lossy().to_string(),
+                path.to_string_lossy().to_string(),
+            ));
+        }
+    }
+    files.sort_by(|a, b| b.0.cmp(&a.0));
+    files.truncate(30);
+    let list: Vec<_> = files
+        .into_iter()
+        .map(|(mtime, size, name, path)| {
+            json!({ "modifiedEpoch": mtime, "sizeMb": (size as f64 / 1048576.0), "name": name, "path": path })
+        })
+        .collect();
+    Json(json!({ "dir": dir.to_string_lossy(), "files": list })).into_response()
+}
+
+/// POST /api/delete — removes a clip from the library AND from disk.
+/// Only library clips / recording-folder files are deletable, and only via
+/// the user's explicit per-item button in the dock.
+async fn api_delete(State(ctx): State<ServerCtx>, Json(body): Json<FileQuery>) -> Response {
+    if !path_allowed(&ctx, &body.path).await {
+        return (StatusCode::FORBIDDEN, "not a library clip").into_response();
+    }
+    if let Err(e) = std::fs::remove_file(&body.path) {
+        if std::path::Path::new(&body.path).exists() {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("Could not delete (is it playing in OBS right now?): {e}"),
+            )
+                .into_response();
+        }
+    }
+    let mut clips = ctx.state.clips.lock().await;
+    clips.retain(|c| c.path != body.path);
+    let _ = crate::config::save_clips(&ctx.state.clips_file, &clips);
+    (StatusCode::OK, "deleted").into_response()
 }
 
 #[derive(serde::Deserialize)]
@@ -378,8 +491,15 @@ const DOCK_HTML: &str = r##"<!doctype html>
     </div>
   </div>
 
-  <h3>Recent clips</h3>
+  <div class="row" style="justify-content: space-between; align-items: baseline;">
+    <h3>Recent clips</h3>
+    <button id="folder-btn" style="padding:3px 8px;font-size:11px">📂 Browse folder</button>
+  </div>
   <div id="clips"><span class="inline">None yet — grab something!</span></div>
+  <div id="folder-section" style="display:none">
+    <h3 id="folder-title">Folder</h3>
+    <div id="folder-files"></div>
+  </div>
 </div>
 <script>
   const status = document.getElementById("status");
@@ -540,6 +660,57 @@ const DOCK_HTML: &str = r##"<!doctype html>
     if (s < 86400) return Math.floor(s / 3600) + "h ago";
     return Math.floor(s / 86400) + "d ago";
   }
+  function sendAsIs(path, durationSecs) {
+    note("Sending…", true);
+    fetch("/api/send_trim", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ path, start: 0, end: durationSecs || 3600, fast: true }),
+    })
+      .then((res) => note(res.ok ? "✓ playing on stream" : "✗ send failed"))
+      .catch(() => note("✗ send failed"));
+  }
+
+  // Two-step delete: first click arms the button, second click deletes.
+  function makeDeleteBtn(path, onDone) {
+    const btn = document.createElement("button");
+    btn.textContent = "🗑";
+    btn.title = "Delete this file";
+    let armed = false, timer = null;
+    btn.addEventListener("click", async (e) => {
+      e.stopPropagation();
+      if (!armed) {
+        armed = true;
+        btn.textContent = "sure?";
+        timer = setTimeout(() => { armed = false; btn.textContent = "🗑"; }, 3000);
+        return;
+      }
+      clearTimeout(timer);
+      const res = await fetch("/api/delete", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ path }),
+      }).catch(() => null);
+      note(res && res.ok ? "✓ deleted" : "✗ " + (res ? await res.text() : "delete failed"));
+      onDone?.();
+    });
+    return btn;
+  }
+
+  function makeRow(leftHtml, path, durationSecs, onChanged) {
+    const row = document.createElement("div");
+    row.className = "clip-row";
+    row.innerHTML = leftHtml;
+    const play = document.createElement("button");
+    play.textContent = "▶";
+    play.title = "Play on stream as-is";
+    play.addEventListener("click", (e) => { e.stopPropagation(); sendAsIs(path, durationSecs); });
+    row.appendChild(play);
+    row.appendChild(makeDeleteBtn(path, onChanged));
+    row.addEventListener("click", () => loadClip(path));
+    return row;
+  }
+
   async function refreshClips() {
     try {
       const res = await fetch("/api/clips");
@@ -548,29 +719,44 @@ const DOCK_HTML: &str = r##"<!doctype html>
       if (!data.clips.length) { box.innerHTML = '<span class="inline">None yet — grab something!</span>'; return; }
       box.innerHTML = "";
       data.clips.slice(0, 8).forEach((c) => {
-        const row = document.createElement("div");
-        row.className = "clip-row";
         const badge = '<span class="badge ' + (c.kind === "trim" ? "trim" : "") + '">' + c.kind + "</span>";
-        row.innerHTML = badge +
-          '<span class="meta">' + ago(c.savedAtEpoch) + " · " + c.durationSecs.toFixed(1) + "s</span>" +
-          '<button title="Play on stream as-is">▶</button>';
-        row.addEventListener("click", () => loadClip(c.path));
-        row.querySelector("button").addEventListener("click", async (e) => {
-          e.stopPropagation();
-          note("Sending…", true);
-          const res = await fetch("/api/send_trim", {
-            method: "POST",
-            headers: { "Content-Type": "application/json" },
-            body: JSON.stringify({ path: c.path, start: 0, end: c.durationSecs, fast: true }),
-          }).catch(() => null);
-          note(res && res.ok ? "✓ playing on stream" : "✗ send failed");
-        });
-        box.appendChild(row);
+        const meta = '<span class="meta">' + ago(c.savedAtEpoch) + " · " + c.durationSecs.toFixed(1) + "s</span>";
+        box.appendChild(makeRow(badge + meta, c.path, c.durationSecs, () => { refreshClips(); refreshFolder(); }));
       });
     } catch { /* app offline */ }
   }
   refreshClips();
   setInterval(refreshClips, 5000);
+
+  // ---- folder browser ----
+  let folderOpen = false;
+  const folderSection = document.getElementById("folder-section");
+  document.getElementById("folder-btn").addEventListener("click", () => {
+    folderOpen = !folderOpen;
+    folderSection.style.display = folderOpen ? "block" : "none";
+    document.getElementById("folder-btn").textContent = folderOpen ? "📂 Hide folder" : "📂 Browse folder";
+    if (folderOpen) refreshFolder();
+  });
+  async function refreshFolder() {
+    if (!folderOpen) return;
+    try {
+      const res = await fetch("/api/folder");
+      if (!res.ok) {
+        document.getElementById("folder-files").innerHTML =
+          '<span class="inline">' + (await res.text()) + "</span>";
+        return;
+      }
+      const data = await res.json();
+      document.getElementById("folder-title").textContent = "Saved in: " + data.dir;
+      const box = document.getElementById("folder-files");
+      box.innerHTML = "";
+      data.files.forEach((f) => {
+        const meta = '<span class="meta" title="' + f.name + '">' + f.name + "</span>" +
+          '<span class="badge">' + ago(f.modifiedEpoch) + " · " + f.sizeMb.toFixed(0) + "MB</span>";
+        box.appendChild(makeRow(meta, f.path, 0, refreshFolder));
+      });
+    } catch { /* app offline */ }
+  }
 </script>
 </body>
 </html>
