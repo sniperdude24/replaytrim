@@ -29,6 +29,10 @@ OBS can save its replay buffer, and plugins can play a file back — but picking
    - **ffmpeg** on your PATH (`winget install ffmpeg`)
 3. Run ReplayTrim, enter your OBS WebSocket password in Settings, and click **Set Up Everything**
 
+### Stream Deck plugin (optional)
+
+Download `com.davidwallace.replaytrim.streamDeckPlugin` from [Releases](https://github.com/sniperdude24/replaytrim/releases) and double-click it — Stream Deck installs it. Five keys: Grab & Trim, Instant Replay, Replay Again, Pause/Resume, and Hide Replay. Requires the ReplayTrim app to be running. Source lives in [`streamdeck-plugin/`](streamdeck-plugin/).
+
 ### Add the OBS dock (recommended)
 
 OBS → View → Docks → **Custom Browser Docks** → add:

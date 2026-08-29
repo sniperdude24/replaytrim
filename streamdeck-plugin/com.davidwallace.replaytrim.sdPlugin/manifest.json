@@ -1,0 +1,83 @@
+{
+  "$schema": "https://schemas.elgato.com/streamdeck/plugins/manifest.json",
+  "Name": "ReplayTrim",
+  "Version": "1.0.0.0",
+  "Author": "David Wallace",
+  "Description": "Instant replays for OBS: grab the replay buffer, play it instantly, and control on-stream playback.",
+  "URL": "https://github.com/sniperdude24/replaytrim",
+  "UUID": "com.davidwallace.replaytrim",
+  "Icon": "imgs/plugin-icon",
+  "CodePath": "bin/plugin.js",
+  "Category": "ReplayTrim",
+  "CategoryIcon": "imgs/plugin-icon",
+  "Nodejs": {
+    "Version": "24"
+  },
+  "SDKVersion": 2,
+  "Software": {
+    "MinimumVersion": "7.1"
+  },
+  "OS": [
+    {
+      "Platform": "windows",
+      "MinimumVersion": "10"
+    }
+  ],
+  "Actions": [
+    {
+      "Name": "Grab & Trim",
+      "UUID": "com.davidwallace.replaytrim.grab",
+      "Icon": "imgs/grab-icon",
+      "Tooltip": "Save the replay buffer and open it for trimming in ReplayTrim",
+      "States": [
+        {
+          "Image": "imgs/grab-key"
+        }
+      ]
+    },
+    {
+      "Name": "Instant Replay",
+      "UUID": "com.davidwallace.replaytrim.instant",
+      "Icon": "imgs/instant-icon",
+      "Tooltip": "Grab the whole replay buffer and play it on stream immediately",
+      "States": [
+        {
+          "Image": "imgs/instant-key"
+        }
+      ]
+    },
+    {
+      "Name": "Replay Again",
+      "UUID": "com.davidwallace.replaytrim.replay",
+      "Icon": "imgs/replay-icon",
+      "Tooltip": "Restart playback of the last clip",
+      "States": [
+        {
+          "Image": "imgs/replay-key"
+        }
+      ]
+    },
+    {
+      "Name": "Pause / Resume",
+      "UUID": "com.davidwallace.replaytrim.pause",
+      "Icon": "imgs/pause-icon",
+      "Tooltip": "Pause or resume the playing replay",
+      "States": [
+        {
+          "Image": "imgs/pause-key"
+        }
+      ]
+    },
+    {
+      "Name": "Hide Replay",
+      "UUID": "com.davidwallace.replaytrim.hide",
+      "Icon": "imgs/hide-icon",
+      "Tooltip": "Instantly stop and hide the replay",
+      "States": [
+        {
+          "Image": "imgs/hide-key"
+        }
+      ]
+    }
+  ]
+}
