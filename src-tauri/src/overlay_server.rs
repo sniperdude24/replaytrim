@@ -23,7 +23,17 @@ pub async fn spawn(
     state: Arc<AppState>,
     port: u16,
 ) -> anyhow::Result<tauri::async_runtime::JoinHandle<()>> {
-    let listener = tokio::net::TcpListener::bind(("127.0.0.1", port)).await?;
+    // Retry until the port frees up — if another instance held it and then
+    // exited, this instance takes over instead of silently never serving.
+    let listener = loop {
+        match tokio::net::TcpListener::bind(("127.0.0.1", port)).await {
+            Ok(l) => break l,
+            Err(e) => {
+                eprintln!("overlay server: port {port} busy ({e}); retrying in 3s");
+                tokio::time::sleep(std::time::Duration::from_secs(3)).await;
+            }
+        }
+    };
     let ctx = ServerCtx { app, state };
     let router = Router::new()
         .route("/overlay", get(overlay_page))
