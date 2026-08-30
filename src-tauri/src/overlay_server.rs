@@ -65,6 +65,8 @@ async fn api_state(State(ctx): State<ServerCtx>) -> Json<serde_json::Value> {
         "hasClip": overlay.clip_path.is_some(),
         "cmdSeq": overlay.cmd_seq,
         "cmd": overlay.cmd,
+        "grabSeq": overlay.grab_seq,
+        "lastGrab": overlay.last_grab,
     }))
 }
 
@@ -77,10 +79,15 @@ async fn api_cmd(
     AxumPath(action): AxumPath<String>,
 ) -> Response {
     match action.as_str() {
-        "grab" => {
-            let _ = ctx.app.emit("dock-grab", ());
-            (StatusCode::OK, "grabbing").into_response()
-        }
+        "grab" => match crate::commands::do_grab(&ctx.state).await {
+            // do_grab bumps grab_seq, so every open dock auto-loads the
+            // clip into its trim editor; the desktop app follows via event.
+            Ok(path) => {
+                let _ = ctx.app.emit("clip-grabbed", path);
+                (StatusCode::OK, "grabbed — ready to trim").into_response()
+            }
+            Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e).into_response(),
+        },
         "instant" => match crate::commands::do_instant(&ctx.state).await {
             Ok(path) => {
                 let _ = ctx.app.emit("clip-grabbed", path.clone());
@@ -627,12 +634,20 @@ const DOCK_HTML: &str = r##"<!doctype html>
       ed.style.flex = "0 1 auto";
       ed.style.minHeight = "0";
       ed.style.overflowY = "auto";
+      // Lists fill whatever height the dock has; when it's short they
+      // shrink to a few rows and scroll internally.
       clipsSection.style.display = "flex";
-      clipsSection.style.flex = "none";
+      clipsSection.style.flex = "1 1 auto";
+      clipsSection.style.minHeight = "0";
       folderSection.style.display = folderOpen ? "flex" : "none";
-      folderSection.style.flex = "none";
+      folderSection.style.flex = folderOpen ? "1 1 auto" : "none";
+      folderSection.style.minHeight = folderOpen ? "0" : "";
       folderBtn.style.display = "";
-      [clipsBox, folderBox].forEach((b) => { b.style.maxHeight = capPx; b.style.flex = ""; });
+      [clipsBox, folderBox].forEach((b) => {
+        b.style.flex = "1";
+        b.style.maxHeight = "none";
+        b.style.minHeight = "90px";
+      });
     } else {
       folderBtn.style.display = "none";
       const map = { "editor": document.getElementById("editor"), "clips-section": clipsSection, "folder-section": folderSection };
@@ -668,11 +683,14 @@ const DOCK_HTML: &str = r##"<!doctype html>
   try { if (localStorage.getItem("rt-collapsed") === "1") setCollapsed(true); } catch {}
 
   // ---- load a clip into the editor ----
-  async function loadClip(path) {
+  async function loadClip(path, opts) {
     clipPath = path;
     startPct = 0; endPct = 1; duration = 0;
     editor.classList.add("active");
     currentTab = "editor";
+    // A fresh grab means "I want to trim this NOW" — make sure the
+    // preview is visible even if the dock was in condensed mode.
+    if (opts && opts.fresh) setCollapsed(false);
     applyView();
     document.getElementById("clip-name").textContent = path.split(/[\\/]/).pop();
     v.src = "/api/file?path=" + encodeURIComponent(path);
@@ -759,6 +777,27 @@ const DOCK_HTML: &str = r##"<!doctype html>
   });
 
   // ---- grab ----
+  // Auto-load grabs triggered elsewhere (Stream Deck key, hotkey, the
+  // desktop app) into this dock's trim editor, via /api/state polling.
+  let lastGrabSeq = -1;
+  async function pollGrabs() {
+    try {
+      const res = await fetch("/api/state");
+      const s = await res.json();
+      if (s.grabSeq !== undefined && s.grabSeq !== lastGrabSeq) {
+        const first = lastGrabSeq === -1;
+        lastGrabSeq = s.grabSeq;
+        if (!first && s.lastGrab && s.lastGrab !== clipPath) {
+          loadClip(s.lastGrab, { fresh: true });
+          note("✓ grabbed — ready to trim", true);
+          refreshClips();
+        }
+      }
+    } catch { /* app offline */ }
+    setTimeout(pollGrabs, 300);
+  }
+  pollGrabs();
+
   const grabBtn = document.getElementById("grab-btn");
   grabBtn.addEventListener("click", async () => {
     grabBtn.disabled = true;
@@ -767,7 +806,7 @@ const DOCK_HTML: &str = r##"<!doctype html>
       const res = await fetch("/api/grab", { method: "POST" });
       if (!res.ok) { note("✗ " + (await res.text())); return; }
       const data = await res.json();
-      await loadClip(data.path);
+      await loadClip(data.path, { fresh: true });
       note("✓ grabbed — trim away");
       refreshClips();
     } catch { note("✗ ReplayTrim app is not running"); }
@@ -871,6 +910,7 @@ const DOCK_HTML: &str = r##"<!doctype html>
         const meta = '<span class="meta">' + ago(c.savedAtEpoch) + " · " + c.durationSecs.toFixed(1) + "s</span>";
         clipsBox.appendChild(makeRow(badge + meta, c.path, c.durationSecs, () => { refreshClips(); refreshFolder(true); }));
       });
+      clipsBox.scrollTop = 0;
     } catch { /* app offline */ }
   }
   refreshClips();

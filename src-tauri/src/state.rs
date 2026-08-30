@@ -26,6 +26,10 @@ pub struct OverlayState {
     /// ("replay" | "pause" | "hide"); the page applies each new seq once.
     pub cmd_seq: u64,
     pub cmd: Option<String>,
+    /// Bumped on every successful grab so docks can auto-load the new clip
+    /// into their trim editor (e.g. when a Stream Deck key triggered it).
+    pub grab_seq: u64,
+    pub last_grab: Option<String>,
 }
 
 pub struct AppState {

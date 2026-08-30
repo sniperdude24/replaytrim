@@ -287,6 +287,9 @@ pub(crate) async fn do_grab(state: &AppState) -> Result<String, String> {
         if let Some(path) = path {
             if !path.is_empty() && path != previous {
                 record_clip(state, &path, "grab").await;
+                let mut overlay = state.overlay.lock().await;
+                overlay.grab_seq += 1;
+                overlay.last_grab = Some(path.clone());
                 return Ok(path);
             }
         }
