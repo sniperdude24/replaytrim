@@ -41,6 +41,11 @@ export async function openSettingsPanel(onSaved) {
         <p class="hint">Click a field, then press the key combo you want. Backspace clears it. Applies on Save — no restart needed. All keybinds work globally, even in-game.</p>
       </fieldset>
       <fieldset>
+        <legend>Startup</legend>
+        <label class="inline-checkbox" style="flex-direction:row"><input type="checkbox" id="autostart-cb"> Launch with Windows (starts minimized to the tray)</label>
+        <p class="hint">Closing the window hides ReplayTrim to the tray; quit from the tray icon.</p>
+      </fieldset>
+      <fieldset>
         <legend>Clip Lists</legend>
         <label>Visible clips before scrolling <input name="clip_list_limit" type="number" min="3" max="30" value="${config.clip_list_limit ?? 5}"></label>
         <p class="hint">The dock's lists show this many rows; older clips stay reachable by scrolling inside the list.</p>
@@ -59,6 +64,13 @@ export async function openSettingsPanel(onSaved) {
 
   const form = document.getElementById("settings-form");
   form.querySelector("#cancel-btn").addEventListener("click", close);
+
+  // Autostart applies immediately (it's system state, not config-file state).
+  const autostartCb = form.querySelector("#autostart-cb");
+  api.getAutostart().then((on) => (autostartCb.checked = on)).catch(() => {});
+  autostartCb.addEventListener("change", () => {
+    api.setAutostart(autostartCb.checked).catch(() => {});
+  });
 
   // Press-to-record keybind fields: click, press a combo, done.
   form.querySelectorAll(".keybind-input").forEach((input) => {

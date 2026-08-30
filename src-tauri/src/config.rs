@@ -29,6 +29,9 @@ pub struct Config {
     /// How many clip rows the dock lists show before internal scrolling.
     #[serde(default = "default_clip_list_limit")]
     pub clip_list_limit: u32,
+    /// One-time flag: autostart was enabled by default on first run.
+    #[serde(default)]
+    pub autostart_configured: bool,
 }
 
 fn default_host() -> String {
@@ -64,6 +67,7 @@ impl Default for Config {
             hide_hotkey: String::new(),
             overlay_port: default_overlay_port(),
             clip_list_limit: default_clip_list_limit(),
+            autostart_configured: false,
         }
     }
 }

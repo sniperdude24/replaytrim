@@ -119,21 +119,12 @@ async function main() {
   document.getElementById("link-btn").addEventListener("click", handleLink);
   document.getElementById("setup-btn").addEventListener("click", handleSetup);
 
-  // Confirm before quitting — the hotkey and overlay stop working while
-  // the app is closed, so an accidental X shouldn't kill it silently.
+  // Closing the window hides to the tray — hotkeys, the dock, and the
+  // overlay keep working. Actually quitting happens from the tray menu.
   const appWindow = window.__TAURI__.window.getCurrentWindow();
   appWindow.onCloseRequested((event) => {
     event.preventDefault();
-    const { close } = openModal(`
-      <h2>Quit ReplayTrim?</h2>
-      <p class="hint">The grab hotkey and the on-stream overlay stop working while the app is closed.</p>
-      <div class="modal-actions">
-        <button id="quit-cancel" class="btn btn-ghost">Cancel</button>
-        <button id="quit-confirm" class="btn btn-danger">Quit</button>
-      </div>
-    `);
-    document.getElementById("quit-cancel").addEventListener("click", close);
-    document.getElementById("quit-confirm").addEventListener("click", () => appWindow.destroy());
+    appWindow.hide();
   });
 
   async function handleConnect() {

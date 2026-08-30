@@ -9,6 +9,7 @@
     "global-shortcut:allow-register",
     "global-shortcut:allow-unregister",
     "global-shortcut:allow-is-registered",
-    "core:window:allow-destroy"
+    "core:window:allow-destroy",
+    "core:window:allow-hide"
   ]
 }

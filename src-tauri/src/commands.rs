@@ -22,6 +22,23 @@ pub async fn save_config(
 }
 
 #[tauri::command]
+pub async fn get_autostart(app: AppHandle) -> Result<bool, String> {
+    use tauri_plugin_autostart::ManagerExt;
+    app.autolaunch().is_enabled().map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+pub async fn set_autostart(app: AppHandle, enabled: bool) -> Result<(), String> {
+    use tauri_plugin_autostart::ManagerExt;
+    let autolaunch = app.autolaunch();
+    if enabled {
+        autolaunch.enable().map_err(|e| e.to_string())
+    } else {
+        autolaunch.disable().map_err(|e| e.to_string())
+    }
+}
+
+#[tauri::command]
 pub async fn connect_obs(state: State<'_, Arc<AppState>>) -> Result<(), String> {
     let config = state.config.lock().await.clone();
     let client = ObsClient::connect(&config.obs_host, config.obs_port, &config.obs_password)
