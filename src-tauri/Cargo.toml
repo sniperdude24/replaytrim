@@ -1,6 +1,6 @@
 [package]
 name = "replaytrim"
-version = "0.5.0"
+version = "0.5.1"
 description = "Instant replays for OBS with a visual trim"
 authors = ["David Wallace"]
 license = "MIT"
