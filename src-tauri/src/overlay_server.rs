@@ -463,6 +463,18 @@ const DOCK_HTML: &str = r##"<!doctype html>
   .pill-sm.active { background: rgba(79,140,255,.2); border-color: #4f8cff; color: #6ea8ff; }
 
   #wrap.tabbed #preview { max-height: 45vh; }
+
+  #pane-trim { min-height: 0; overflow: hidden; flex: none; }
+  #pane-clips { display: flex; flex-direction: column; gap: 8px; min-height: 0;
+    overflow: hidden; flex: none; }
+  #divider { height: 12px; display: none; align-items: center; justify-content: center;
+    cursor: ns-resize; touch-action: none; flex: none; }
+  #divider .grip { width: 44px; height: 4px; background: #3a3e46; border-radius: 2px; }
+  #divider:hover .grip, #divider.dragging .grip { background: #4f8cff; }
+  .lock-btn { padding: 3px 8px; font-size: 11px; }
+  .lock-btn.locked { border-color: #4f8cff; color: #6ea8ff; background: rgba(79,140,255,.15); }
+  #wrap.tabbed #pane-trim, #wrap.tabbed #pane-clips { display: contents; }
+  #wrap.tabbed #divider, #wrap.tabbed .lock-btn { display: none !important; }
   .row { display: flex; gap: 6px; flex-wrap: wrap; }
   button {
     font: 600 12.5px "Segoe UI", sans-serif; color: #fff; cursor: pointer;
@@ -531,10 +543,14 @@ const DOCK_HTML: &str = r##"<!doctype html>
     <span data-tab="folder-section">Folder</span>
   </div>
 
+  <div id="pane-trim">
   <div id="editor" class="tab-section tab-active">
-    <div class="row" style="justify-content: space-between; align-items: center;">
-      <span class="inline" id="clip-name" style="overflow:hidden;text-overflow:ellipsis;white-space:nowrap;max-width:60%"></span>
-      <button id="toggle-preview">▤ Hide preview</button>
+    <div class="row" style="justify-content: space-between; align-items: center; flex-wrap: nowrap;">
+      <span class="inline" id="clip-name" style="overflow:hidden;text-overflow:ellipsis;white-space:nowrap;max-width:55%"></span>
+      <span style="display:flex;gap:4px">
+        <button id="lock-trim" class="lock-btn" title="Lock this pane's height (dock resizes won't change it)">🔓</button>
+        <button id="toggle-preview">▤ Hide preview</button>
+      </span>
     </div>
     <div id="trim-stack">
       <video id="preview" playsinline></video>
@@ -555,11 +571,18 @@ const DOCK_HTML: &str = r##"<!doctype html>
       <button class="primary" id="send-btn" style="margin-left:auto">Send &amp; Play</button>
     </div>
   </div>
+  </div>
 
+  <div id="divider" title="Drag to resize the panes"><span class="grip"></span></div>
+
+  <div id="pane-clips">
   <div id="clips-section" class="tab-section" style="display:flex;flex-direction:column;gap:4px;min-height:0">
-    <div class="row" style="justify-content: space-between; align-items: baseline;">
+    <div class="row" style="justify-content: space-between; align-items: baseline; flex-wrap: nowrap;">
       <h3>Recent clips</h3>
-      <button id="folder-btn" style="padding:3px 8px;font-size:11px">📂 Browse folder</button>
+      <span style="display:flex;gap:4px">
+        <button id="lock-clips" class="lock-btn" title="Lock this pane's height (dock resizes won't change it)">🔓</button>
+        <button id="folder-btn" style="padding:3px 8px;font-size:11px">📂 Browse folder</button>
+      </span>
     </div>
     <div id="clips" class="list-box"><span class="inline">None yet — grab something!</span></div>
   </div>
@@ -571,6 +594,7 @@ const DOCK_HTML: &str = r##"<!doctype html>
     </div>
     <p id="folder-title" style="font-size:10.5px;color:#9aa0aa;margin:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap"></p>
     <div id="folder-files" class="list-box"></div>
+  </div>
   </div>
 </div>
 <script>
@@ -625,17 +649,13 @@ const DOCK_HTML: &str = r##"<!doctype html>
     wrap.classList.toggle("tabbed", !stacked);
     tabbar.style.display = stacked ? "none" : "flex";
     layoutBtn.textContent = stacked ? "⇆ Tabs" : "⇆ Stacked";
-    const capPx = (listLimit * 31 + 6) + "px";
     if (stacked) {
       const ed = document.getElementById("editor");
       ed.style.display = ed.classList.contains("active") ? "flex" : "none";
-      // The editor may not push the lists off the (unscrollable) page:
-      // it yields space and scrolls internally when the dock is short.
-      ed.style.flex = "0 1 auto";
+      ed.style.flex = "";
       ed.style.minHeight = "0";
-      ed.style.overflowY = "auto";
-      // Lists fill whatever height the dock has; when it's short they
-      // shrink to a few rows and scroll internally.
+      ed.style.overflow = "hidden";
+      ed.style.height = "100%";
       clipsSection.style.display = "flex";
       clipsSection.style.flex = "1 1 auto";
       clipsSection.style.minHeight = "0";
@@ -646,11 +666,17 @@ const DOCK_HTML: &str = r##"<!doctype html>
       [clipsBox, folderBox].forEach((b) => {
         b.style.flex = "1";
         b.style.maxHeight = "none";
-        b.style.minHeight = "90px";
+        b.style.minHeight = "40px";
       });
+      layoutPanes();
     } else {
+      paneTrim.style.height = "";
+      paneClips.style.height = "";
       folderBtn.style.display = "none";
-      const map = { "editor": document.getElementById("editor"), "clips-section": clipsSection, "folder-section": folderSection };
+      const ed = document.getElementById("editor");
+      ed.style.height = "";
+      ed.style.overflow = "";
+      const map = { "editor": ed, "clips-section": clipsSection, "folder-section": folderSection };
       for (const [id, el] of Object.entries(map)) {
         const show = id === currentTab;
         el.style.display = show ? "flex" : "none";
@@ -663,6 +689,85 @@ const DOCK_HTML: &str = r##"<!doctype html>
       s.classList.toggle("active", s.dataset.tab === currentTab));
     sizeStack();
   }
+
+  // ---- resizable, lockable split panes (stacked layout) ----
+  const paneTrim = document.getElementById("pane-trim");
+  const paneClips = document.getElementById("pane-clips");
+  const divider = document.getElementById("divider");
+  const lockTrimBtn = document.getElementById("lock-trim");
+  const lockClipsBtn = document.getElementById("lock-clips");
+  const TRIM_MIN = 150, CLIPS_MIN = 70;
+  let splitPx = 0;
+  let lockMode = "";
+  let lastAvail = 0;
+  try {
+    splitPx = parseFloat(localStorage.getItem("rt-split")) || 0;
+    lockMode = localStorage.getItem("rt-lock") || "";
+  } catch {}
+
+  function updateLockIcons() {
+    lockTrimBtn.textContent = lockMode === "trim" ? "🔒" : "🔓";
+    lockTrimBtn.classList.toggle("locked", lockMode === "trim");
+    lockClipsBtn.textContent = lockMode === "clips" ? "🔒" : "🔓";
+    lockClipsBtn.classList.toggle("locked", lockMode === "clips");
+  }
+  function setLock(which) {
+    lockMode = lockMode === which ? "" : which; // one lock at a time
+    try { localStorage.setItem("rt-lock", lockMode); } catch {}
+    updateLockIcons();
+  }
+  lockTrimBtn.addEventListener("click", () => setLock("trim"));
+  lockClipsBtn.addEventListener("click", () => setLock("clips"));
+  updateLockIcons();
+
+  function availableHeight() {
+    return wrap.clientHeight - paneTrim.offsetTop - divider.offsetHeight - 16;
+  }
+
+  function layoutPanes(fromDrag) {
+    if (layout !== "stacked" || !window.innerHeight) return;
+    const editorActive = editor.classList.contains("active");
+    divider.style.display = editorActive ? "flex" : "none";
+    paneTrim.style.display = editorActive ? "block" : "none";
+    if (!editorActive) {
+      paneClips.style.flex = "1 1 auto";
+      paneClips.style.height = "";
+      lastAvail = 0;
+      return;
+    }
+    const avail = availableHeight();
+    if (avail < TRIM_MIN + CLIPS_MIN) return;
+    if (!splitPx) splitPx = Math.round(avail * 0.55);
+    // Distribute dock resizes according to the lock.
+    if (!fromDrag && lastAvail && Math.abs(avail - lastAvail) > 1) {
+      if (lockMode === "clips") splitPx += avail - lastAvail;
+      else if (lockMode !== "trim") splitPx = splitPx * (avail / lastAvail);
+    }
+    lastAvail = avail;
+    splitPx = Math.min(Math.max(splitPx, TRIM_MIN), avail - CLIPS_MIN);
+    paneTrim.style.height = Math.round(splitPx) + "px";
+    paneClips.style.flex = "none";
+    paneClips.style.height = Math.round(avail - splitPx) + "px";
+    try { localStorage.setItem("rt-split", String(Math.round(splitPx))); } catch {}
+    sizeStack();
+  }
+  window.addEventListener("resize", () => layoutPanes());
+
+  let dividerDragging = false;
+  divider.addEventListener("pointerdown", (e) => {
+    dividerDragging = true;
+    divider.classList.add("dragging");
+    divider.setPointerCapture(e.pointerId);
+  });
+  divider.addEventListener("pointermove", (e) => {
+    if (!dividerDragging) return;
+    splitPx = e.clientY - paneTrim.getBoundingClientRect().top;
+    layoutPanes(true);
+  });
+  divider.addEventListener("pointerup", () => {
+    dividerDragging = false;
+    divider.classList.remove("dragging");
+  });
   layoutBtn.addEventListener("click", () => {
     layout = layout === "stacked" ? "tabbed" : "stacked";
     try { localStorage.setItem("rt-layout", layout); } catch {}
@@ -674,9 +779,19 @@ const DOCK_HTML: &str = r##"<!doctype html>
   // ---- collapse toggle (remembered) ----
   const toggleBtn = document.getElementById("toggle-preview");
   function setCollapsed(collapsed) {
+    const was = editor.classList.contains("collapsed");
     editor.classList.toggle("collapsed", collapsed);
     toggleBtn.textContent = collapsed ? "▤ Show preview" : "▤ Hide preview";
     try { localStorage.setItem("rt-collapsed", collapsed ? "1" : ""); } catch {}
+    // Collapsing shrinks the trim pane to just the controls; expanding
+    // restores the previous split.
+    if (collapsed && !was) {
+      try { localStorage.setItem("rt-split-full", String(Math.round(splitPx))); } catch {}
+      splitPx = TRIM_MIN;
+    } else if (!collapsed && was) {
+      try { splitPx = parseFloat(localStorage.getItem("rt-split-full")) || splitPx; } catch {}
+    }
+    layoutPanes(true);
     sizeStack();
   }
   toggleBtn.addEventListener("click", () => setCollapsed(!editor.classList.contains("collapsed")));
@@ -708,7 +823,16 @@ const DOCK_HTML: &str = r##"<!doctype html>
       return;
     }
     if (!window.innerHeight) return; // hidden dock reports 0x0 — keep last size
-    const maxH = Math.min(220, window.innerHeight * (layout === "tabbed" ? 0.45 : 0.26));
+    // The video's height budget is whatever its pane gives it after the
+    // fixed rows (header + waveform + times + actions ≈ 175px), so the
+    // trim UI itself never needs a scrollbar.
+    let maxH;
+    if (layout === "tabbed") {
+      maxH = window.innerHeight * 0.45;
+    } else {
+      maxH = (paneTrim.clientHeight || 300) - 175;
+    }
+    maxH = Math.max(40, Math.min(420, maxH));
     const avail = editor.clientWidth || wrap.clientWidth;
     const w = Math.min(avail, maxH * v.videoWidth / v.videoHeight);
     trimStack.style.width = Math.max(120, Math.round(w)) + "px";
